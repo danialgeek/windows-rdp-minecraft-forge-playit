@@ -446,3 +446,17 @@ jobs:
           Write-Host "Requested keep-alive duration: 48 hours"
           Write-Host "GitHub-hosted runner maximum: 6 hours"
           Start-Sleep -Seconds 172800
+
+
+      # ==========================================
+      # 11. KEEP SERVER ALIVE (48 HOURS)
+      # ==========================================
+
+      - name: 4. Keep Server Alive (48 Hours)
+        if: always()
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 2880; $i++) {
+            Start-Sleep -Seconds 60
+            Write-Host "[$i/2880] Server running..."
+          }
