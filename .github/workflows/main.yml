@@ -42,7 +42,7 @@ jobs:
         
           $Backup = "$env:GITHUB_WORKSPACE\persistent-data\Minecraft"
           
-          $Server = "C:\RDP-Persistent\Minecraft"
+          $Server = 'C:\RDP-Persistent\Minecraft'
           
           New-Item -ItemType Directory -Force -Path $Server | Out-Null
           
@@ -50,7 +50,7 @@ jobs:
           
             robocopy $Backup $Server /E /R:2 /W:2
             
-            if ($LASTEXITCODE -ge 8) { throw "Minecraft restore failed!" }
+            if ($LASTEXITCODE -ge 8) { Write-Warning "Restore robocopy code $LASTEXITCODE; continuing with available files." }
             
           }
           
@@ -74,7 +74,7 @@ jobs:
         
         run: |
         
-          $Server = "C:\RDP-Persistent\Minecraft"
+          $Server = 'C:\RDP-Persistent\Minecraft'
           
           New-Item -ItemType Directory -Force -Path $Server | Out-Null
           
@@ -84,15 +84,15 @@ jobs:
           
             $Installer = "$Server\forge-installer.jar"
             
-            Invoke-WebRequest "https://maven.minecraftforge.net/net/minecraftforge/forge/1.20.1-47.4.10/forge-1.20.1-47.4.10-installer.jar" -OutFile $Installer
+            Invoke-WebRequest 'https://maven.minecraftforge.net/net/minecraftforge/forge/1.20.1-47.4.10/forge-1.20.1-47.4.10-installer.jar' -OutFile $Installer
             
             java -jar $Installer --installServer
             
-            if (!(Test-Path "$Server\run.bat")) { throw "Forge installation failed!" }
-            
           }
           
-          Set-Content "$Server\eula.txt" "eula=true"
+          if (!(Test-Path "$Server\run.bat")) { throw 'Forge installation failed!' }
+          
+          Set-Content "$Server\eula.txt" 'eula=true'
           
 
 
@@ -102,9 +102,9 @@ jobs:
         
         run: |
         
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' fDenyTSConnections 0
           
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' UserAuthentication 1
           
           New-NetFirewallRule -DisplayName 'RDP Tailscale' -Direction Inbound -Protocol TCP -LocalPort 3389 -RemoteAddress 100.64.0.0/10 -Action Allow -ErrorAction SilentlyContinue
           
@@ -120,17 +120,11 @@ jobs:
           
         run: |
         
-          if (!$env:RDP_PASSWORD) { throw 'RDP_PASSWORD missing!' }
+          $p = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
           
-          $Password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          if (!(Get-LocalUser NvDAdmin -ErrorAction SilentlyContinue) -and $env:RDP_PASSWORD) { New-LocalUser NvDAdmin -Password $p -PasswordNeverExpires }
           
-          if (!(Get-LocalUser -Name NvDAdmin -ErrorAction SilentlyContinue)) {
-          
-            New-LocalUser -Name NvDAdmin -Password $Password -PasswordNeverExpires
-            
-          }
-          
-          Add-LocalGroupMember -Group Administrators -Member NvDAdmin -ErrorAction SilentlyContinue
+          Add-LocalGroupMember Administrators NvDAdmin -ErrorAction SilentlyContinue
           
 
 
@@ -144,8 +138,6 @@ jobs:
           
         run: |
         
-          if (!$env:TAILSCALE_AUTHKEY) { throw 'TAILSCALE_AUTHKEY missing!' }
-          
           Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile C:\tailscale.msi
           
           Start-Process msiexec -ArgumentList '/i C:\tailscale.msi /quiet /norestart' -Wait
@@ -156,11 +148,7 @@ jobs:
           
           Start-Sleep 8
           
-          $IP = & 'C:\Program Files\Tailscale\tailscale.exe' ip -4
-          
-          Write-Host "RDP SERVER READY"
-          
-          Write-Host "Tailscale IP: $IP"
+          Write-Host "Tailscale IP: $(& 'C:\Program Files\Tailscale\tailscale.exe' ip -4)"
           
           Write-Host 'Username: NvDAdmin'
           
@@ -176,18 +164,9 @@ jobs:
           
         run: |
         
-          if (!$env:PLAYIT_SECRET_KEY) { throw 'PLAYIT_SECRET_KEY missing!' }
+          Invoke-WebRequest 'https://github.com/playit-cloud/playit-agent/releases/download/v2.0.2/playitd-windows-x86_64.exe' -OutFile C:\playitd.exe
           
-          $Agent = 'C:\playitd.exe'
-          
-          Invoke-WebRequest 'https://github.com/playit-c
-
-
-
-
-
-
-
+          $p = Start-Process C:\playitd.exe -ArgumentList @('--secre
 
 
 
