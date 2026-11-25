@@ -429,3 +429,20 @@ jobs:
               Write-Host "Server session finished."
 
           }
+
+
+      # ==========================================
+      # 10. KEEP RUNNER ALIVE
+      # ==========================================
+      # GitHub-hosted runners enforce a maximum job duration of 6 hours.
+      # This step requests 48 hours, but GitHub will terminate the job at
+      # the configured 360-minute timeout. A persistent runner is required
+      # for a real 48-hour session.
+
+      - name: Keep Runner Alive (GitHub limit applies)
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "Requested keep-alive duration: 48 hours"
+          Write-Host "GitHub-hosted runner maximum: 6 hours"
+          Start-Sleep -Seconds 172800
