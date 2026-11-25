@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 360
 
     env:
-      SERVER_DIR: C:\RDP-Persistent\Minecraft
+      SERVER_DIR: C:\Users\NvDAdmin\Desktop\Minecraft
       BACKUP_DIR: ${{ github.workspace }}\persistent-data\Minecraft
 
     steps:
@@ -26,75 +26,20 @@ jobs:
         with:
           persist-credentials: true
 
-      - name: Restore Minecraft Backup
-        shell: pwsh
-        run: |
-          $Server = $env:SERVER_DIR
-          $Backup = $env:BACKUP_DIR
-
-          New-Item -ItemType Directory -Force -Path $Server | Out-Null
-
-          if (Test-Path $Backup) {
-              robocopy $Backup $Server /E /R:2 /W:2
-              $rc = $LASTEXITCODE
-
-              if ($rc -ge 8) {
-                  throw "Backup restore failed. Robocopy code: $rc"
-              }
-
-              Write-Host "Minecraft backup restored."
-          }
-          else {
-              Write-Host "No previous backup found."
-          }
-
-          $global:LASTEXITCODE = 0
-          exit 0
-
-      - name: Install Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Install Minecraft Forge
-        shell: pwsh
-        run: |
-          $Server = $env:SERVER_DIR
-          New-Item -ItemType Directory -Force -Path $Server | Out-Null
-          Set-Location $Server
-
-          if (!(Test-Path "$Server\run.bat")) {
-              $Installer = "$env:RUNNER_TEMP\forge-installer.jar"
-
-              Invoke-WebRequest `
-                -Uri "https://maven.minecraftforge.net/net/minecraftforge/forge/1.20.1-47.4.10/forge-1.20.1-47.4.10-installer.jar" `
-                -OutFile $Installer
-
-              java -jar $Installer --installServer
-
-              if ($LASTEXITCODE -ne 0) {
-                  throw "Forge installation failed."
-              }
-          }
-
-          Set-Content -Path "$Server\eula.txt" -Value "eula=true"
-          Write-Host "Forge is ready."
-
       - name: Enable RDP
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
               throw "RDP_PASSWORD secret is missing."
           }
 
           $User = "NvDAdmin"
 
-          $Existing = Get-LocalUser -Name $User -ErrorAction SilentlyContinue
-
-          if ($Existing) {
+          if (Get-LocalUser -Name $User -ErrorAction SilentlyContinue) {
               net user $User "$env:RDP_PASSWORD"
           }
           else {
@@ -108,7 +53,9 @@ jobs:
             -Name "fDenyTSConnections" `
             -Value 0
 
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
 
           New-NetFirewallRule `
             -DisplayName "RDP via Tailscale" `
@@ -116,12 +63,15 @@ jobs:
             -Protocol TCP `
             -LocalPort 3389 `
             -RemoteAddress 100.64.0.0/10 `
-            -Action Allow `
-            -ErrorAction SilentlyContinue
+            -Action Allow
 
           Set-Service TermService -StartupType Automatic
           Start-Service TermService
 
+          New-Item -ItemType Directory -Force `
+            -Path "C:\Users\NvDAdmin\Desktop" | Out-Null
+
+          Write-Host "RDP username: .\NvDAdmin"
           Write-Host "RDP enabled."
 
       - name: Install and Connect Tailscale
@@ -129,6 +79,8 @@ jobs:
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
               throw "TAILSCALE_AUTHKEY secret is missing."
           }
@@ -151,6 +103,7 @@ jobs:
 
           Start-Sleep -Seconds 10
 
+          Write-Host "Tailscale IP:"
           & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
 
       - name: Start Playit
@@ -158,33 +111,124 @@ jobs:
         env:
           PLAYIT_SECRET_KEY: ${{ secrets.PLAYIT_SECRET_KEY }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           if ([string]::IsNullOrWhiteSpace($env:PLAYIT_SECRET_KEY)) {
               throw "PLAYIT_SECRET_KEY secret is missing."
           }
 
           $Playit = "$env:RUNNER_TEMP\playit.exe"
-          $PlayitLog = "$env:RUNNER_TEMP\playit.log"
-          $PlayitError = "$env:RUNNER_TEMP\playit-error.log"
 
           Invoke-WebRequest `
             -Uri "https://github.com/playit-cloud/playit-agent/releases/download/v2.0.2/playit-windows-x86_64.exe" `
             -OutFile $Playit
 
-          $PlayitProcess = Start-Process `
+          $Process = Start-Process `
             -FilePath $Playit `
             -ArgumentList @("--secret", $env:PLAYIT_SECRET_KEY) `
             -PassThru `
             -WindowStyle Hidden `
-            -RedirectStandardOutput $PlayitLog `
-            -RedirectStandardError $PlayitError
+            -RedirectStandardOutput "$env:RUNNER_TEMP\playit.log" `
+            -RedirectStandardError "$env:RUNNER_TEMP\playit-error.log"
 
-          Write-Host "Playit started. PID: $($PlayitProcess.Id)"
+          Write-Host "Playit started. PID: $($Process.Id)"
 
-      - name: Run Minecraft and Keep Runner Alive
+      - name: Install Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore Minecraft to Desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $Server = $env:SERVER_DIR
+          $Backup = $env:BACKUP_DIR
+
+          New-Item -ItemType Directory -Force -Path $Server | Out-Null
+
+          if (Test-Path $Backup) {
+              robocopy $Backup $Server /E /R:2 /W:2
+              $rc = $LASTEXITCODE
+
+              if ($rc -ge 8) {
+                  throw "Restore failed. Robocopy code: $rc"
+              }
+
+              Write-Host "Minecraft files restored."
+          }
+          else {
+              Write-Host "No previous backup found."
+          }
+
+          $global:LASTEXITCODE = 0
+
+      - name: Install Forge and Prepare run.bat
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $Server = $env:SERVER_DIR
+          Set-Location $Server
+
+          # Make Java available to the RDP user's future session.
+          $JavaBin = Join-Path $env:JAVA_HOME "bin"
+          [Environment]::SetEnvironmentVariable(
+              "JAVA_HOME", $env:JAVA_HOME, "Machine"
+          )
+
+          $MachinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+
+          if ($MachinePath -notlike "*$JavaBin*") {
+              [Environment]::SetEnvironmentVariable(
+                  "Path", "$MachinePath;$JavaBin", "Machine"
+              )
+          }
+
+          if (!(Test-Path "$Server\run.bat")) {
+              $Installer = "$env:RUNNER_TEMP\forge-installer.jar"
+
+              Invoke-WebRequest `
+                -Uri "https://maven.minecraftforge.net/net/minecraftforge/forge/1.20.1-47.4.10/forge-1.20.1-47.4.10-installer.jar" `
+                -OutFile $Installer
+
+              java -jar $Installer --installServer
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Forge installation failed."
+              }
+          }
+
+          $ArgsFile = "$Server\libraries\net\minecraftforge\forge\1.20.1-47.4.10\win_args.txt"
+
+          if (!(Test-Path $ArgsFile)) {
+              throw "Forge win_args.txt not found."
+          }
+
+          if (!(Test-Path "$Server\user_jvm_args.txt")) {
+              Set-Content "$Server\user_jvm_args.txt" "-Xms2G -Xmx5G"
+          }
+
+          if (!(Test-Path "$Server\run.bat")) {
+              @'
+          @echo off
+          cd /d "%~dp0"
+          java @user_jvm_args.txt @libraries\net\minecraftforge\forge\1.20.1-47.4.10\win_args.txt nogui
+          pause
+          '@ | Set-Content "$Server\run.bat" -Encoding ASCII
+          }
+
+          Set-Content "$Server\eula.txt" "eula=true"
+
+          Write-Host "Forge is ready."
+          Write-Host "run.bat is ready."
+
+      - name: Keep RDP Alive and Backup Minecraft
         shell: pwsh
         timeout-minutes: 345
         env:
-          GH_TOKEN: ${{ github.token }}
           BRANCH_NAME: ${{ github.ref_name }}
         run: |
           $ErrorActionPreference = "Stop"
@@ -192,32 +236,155 @@ jobs:
           $Server = $env:SERVER_DIR
           $Backup = $env:BACKUP_DIR
 
-          New-Item -ItemType Directory -Force -Path $Backup | Out-Null
           Set-Location $Server
+          New-Item -ItemType Directory -Force -Path $Backup | Out-Null
 
-          function Save-MinecraftBackup {
-              Write-Host "Starting Minecraft backup..."
+          # Configure a temporary local-only RCON password.
+          $RconPassword = (
+              [guid]::NewGuid().ToString("N") +
+              [guid]::NewGuid().ToString("N")
+          )
 
-              if ($script:MinecraftProcess -and !$script:MinecraftProcess.HasExited) {
-                  try {
-                      $script:MinecraftProcess.StandardInput.WriteLine("save-all flush")
-                      Start-Sleep -Seconds 5
-                  }
-                  catch {
-                      Write-Warning "Could not send save-all."
+          $PropertiesFile = "$Server\server.properties"
+
+          if (Test-Path $PropertiesFile) {
+              $Lines = @(Get-Content $PropertiesFile)
+          }
+          else {
+              $Lines = @()
+          }
+
+          $Settings = @{
+              "enable-rcon" = "true"
+              "rcon.port" = "25575"
+              "rcon.password" = $RconPassword
+              "broadcast-rcon-to-ops" = "false"
+          }
+
+          foreach ($Key in $Settings.Keys) {
+              $Found = $false
+
+              for ($i = 0; $i -lt $Lines.Count; $i++) {
+                  if ($Lines[$i] -match "^$([regex]::Escape($Key))=") {
+                      $Lines[$i] = "$Key=$($Settings[$Key])"
+                      $Found = $true
                   }
               }
 
-              robocopy $Server $Backup /MIR /R:2 /W:2 /XD "$Server\logs" "$Server\crash-reports"
+              if (!$Found) {
+                  $Lines += "$Key=$($Settings[$Key])"
+              }
+          }
 
-              $rc = $LASTEXITCODE
+          Set-Content $PropertiesFile -Value $Lines -Encoding ASCII
 
-              if ($rc -ge 8) {
-                  throw "Robocopy backup failed. Code: $rc"
+          function Read-RconExact {
+              param(
+                  [System.IO.Stream]$Stream,
+                  [int]$Count
+              )
+
+              $Buffer = New-Object byte[] $Count
+              $Offset = 0
+
+              while ($Offset -lt $Count) {
+                  $Read = $Stream.Read($Buffer, $Offset, $Count - $Offset)
+
+                  if ($Read -le 0) {
+                      throw "RCON connection closed."
+                  }
+
+                  $Offset += $Read
               }
 
-              $global:LASTEXITCODE = 0
+              return ,$Buffer
+          }
 
+          function Send-RconPacket {
+              param(
+                  [System.IO.Stream]$Stream,
+                  [int]$Id,
+                  [int]$Type,
+                  [string]$Body
+              )
+
+              $BodyBytes = [Text.Encoding]::ASCII.GetBytes($Body)
+              $Length = 10 + $BodyBytes.Length
+              $Packet = New-Object byte[] (4 + $Length)
+
+              [BitConverter]::GetBytes($Length).CopyTo($Packet, 0)
+              [BitConverter]::GetBytes($Id).CopyTo($Packet, 4)
+              [BitConverter]::GetBytes($Type).CopyTo($Packet, 8)
+
+              if ($BodyBytes.Length -gt 0) {
+                  $BodyBytes.CopyTo($Packet, 12)
+              }
+
+              $Packet[12 + $BodyBytes.Length] = 0
+              $Packet[13 + $BodyBytes.Length] = 0
+
+              $Stream.Write($Packet, 0, $Packet.Length)
+              $Stream.Flush()
+          }
+
+          function Read-RconPacket {
+              param([System.IO.Stream]$Stream)
+
+              $LengthBytes = Read-RconExact $Stream 4
+              $Length = [BitConverter]::ToInt32($LengthBytes, 0)
+
+              if ($Length -lt 10 -or $Length -gt 65536) {
+                  throw "Invalid RCON packet."
+              }
+
+              $Data = Read-RconExact $Stream $Length
+
+              $BodyLength = $Length - 10
+              $Body = ""
+
+              if ($BodyLength -gt 0) {
+                  $Body = [Text.Encoding]::ASCII.GetString(
+                      $Data, 8, $BodyLength
+                  )
+              }
+
+              return [pscustomobject]@{
+                  Id = [BitConverter]::ToInt32($Data, 0)
+                  Type = [BitConverter]::ToInt32($Data, 4)
+                  Body = $Body
+              }
+          }
+
+          function Invoke-RconCommand {
+              param([string]$Command)
+
+              $Client = New-Object System.Net.Sockets.TcpClient
+
+              try {
+                  $Client.ReceiveTimeout = 5000
+                  $Client.SendTimeout = 5000
+                  $Client.Connect("127.0.0.1", 25575)
+
+                  $Stream = $Client.GetStream()
+
+                  Send-RconPacket $Stream 100 3 $RconPassword
+                  $Auth = Read-RconPacket $Stream
+
+                  if ($Auth.Id -eq -1 -or $Auth.Id -ne 100) {
+                      throw "RCON authentication failed."
+                  }
+
+                  Send-RconPacket $Stream 101 2 $Command
+                  $Response = Read-RconPacket $Stream
+
+                  return $Response.Body
+              }
+              finally {
+                  $Client.Close()
+              }
+          }
+
+          function Push-MinecraftBackup {
               git -C $env:GITHUB_WORKSPACE add -- persistent-data/Minecraft
 
               if ($LASTEXITCODE -ne 0) {
@@ -229,7 +396,10 @@ jobs:
               $global:LASTEXITCODE = 0
 
               if ($Changes -eq 1) {
-                  git -C $env:GITHUB_WORKSPACE commit -m "Minecraft automatic backup"
+                  git -C $env:GITHUB_WORKSPACE `
+                    -c user.name="github-actions[bot]" `
+                    -c user.email="41898282+github-actions[bot]@users.noreply.github.com" `
+                    commit -m "Minecraft automatic backup"
 
                   if ($LASTEXITCODE -ne 0) {
                       throw "Git commit failed."
@@ -253,38 +423,100 @@ jobs:
               $global:LASTEXITCODE = 0
           }
 
-          $script:MinecraftProcess = $null
+          function Save-MinecraftBackup {
+              param([switch]$ServerStopped)
 
-          try {
-              $StartInfo = New-Object System.Diagnostics.ProcessStartInfo
-              $StartInfo.FileName = "cmd.exe"
-              $StartInfo.Arguments = "/c run.bat nogui"
-              $StartInfo.WorkingDirectory = $Server
-              $StartInfo.UseShellExecute = $false
-              $StartInfo.CreateNoWindow = $true
-              $StartInfo.RedirectStandardInput = $true
-              $StartInfo.RedirectStandardOutput = $true
-              $StartInfo.RedirectStandardError = $true
+              $RconLocked = $false
 
-              $script:MinecraftProcess = New-Object System.Diagnostics.Process
-              $script:MinecraftProcess.StartInfo = $StartInfo
+              try {
+                  if (!$ServerStopped) {
+                      try {
+                          Invoke-RconCommand "save-off" | Out-Null
+                          $RconLocked = $true
 
-              if (!$script:MinecraftProcess.Start()) {
-                  throw "Minecraft process could not start."
+                          Invoke-RconCommand "save-all flush" | Out-Null
+                          Start-Sleep -Seconds 3
+                      }
+                      catch {
+                          if ($RconLocked) {
+                              try {
+                                  Invoke-RconCommand "save-on" | Out-Null
+                              } catch {}
+                          }
+
+                          Write-Host "Server is not ready. Backup skipped."
+                          return
+                      }
+                  }
+
+                  Write-Host "Copying Minecraft files..."
+
+                  robocopy $Server $Backup /MIR /R:2 /W:2 `
+                    /XF session.lock `
+                    /XD "$Server\logs" "$Server\crash-reports"
+
+                  $RC = $LASTEXITCODE
+
+                  if ($RC -ge 8) {
+                      throw "Robocopy failed. Code: $RC"
+                  }
+              }
+              finally {
+                  if ($RconLocked) {
+                      try {
+                          Invoke-RconCommand "save-on" | Out-Null
+                          Write-Host "Minecraft saving enabled again."
+                      }
+                      catch {
+                          Write-Warning "Could not send save-on."
+                      }
+                  }
               }
 
-              # Drain output asynchronously to prevent pipe blocking.
-              $StdOutTask = $script:MinecraftProcess.StandardOutput.ReadToEndAsync()
-              $StdErrTask = $script:MinecraftProcess.StandardError.ReadToEndAsync()
+              # Never store the temporary RCON password in GitHub.
+              $BackupProperties = "$Backup\server.properties"
 
-              Write-Host "Minecraft started. PID: $($script:MinecraftProcess.Id)"
+              if (Test-Path $BackupProperties) {
+                  $BackupLines = Get-Content $BackupProperties |
+                      ForEach-Object {
+                          if ($_ -match "^rcon\.password=") {
+                              "rcon.password="
+                          }
+                          else {
+                              $_
+                          }
+                      }
 
-              $StartedAt = Get-Date
-              $NextBackup = (Get-Date).AddMinutes(5)
-              $MaximumRuntime = [TimeSpan]::FromMinutes(330)
+                  Set-Content $BackupProperties `
+                    -Value $BackupLines -Encoding ASCII
+              }
 
-              while (!$script:MinecraftProcess.HasExited) {
-                  Start-Sleep -Seconds 10
+              Push-MinecraftBackup
+          }
+
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "MINECRAFT SERVER IS READY"
+          Write-Host "======================================"
+          Write-Host "RDP user: .\NvDAdmin"
+          Write-Host "Server folder: $Server"
+          Write-Host "Start the server manually using run.bat."
+          Write-Host "Playit is running in the background."
+          Write-Host "======================================"
+
+          $StartedAt = Get-Date
+          $NextBackup = (Get-Date).AddMinutes(5)
+          $NextStatus = (Get-Date).AddSeconds(60)
+          $MaximumRuntime = [TimeSpan]::FromMinutes(330)
+
+          try {
+              while (((Get-Date) - $StartedAt) -lt $MaximumRuntime) {
+                  Start-Sleep -Seconds 15
+
+                  if ((Get-Date) -ge $NextStatus) {
+                      Write-Host "Runner is alive. Waiting for manual server operation."
+                      $NextStatus = (Get-Date).AddSeconds(60)
+                  }
 
                   if ((Get-Date) -ge $NextBackup) {
                       try {
@@ -296,44 +528,47 @@ jobs:
 
                       $NextBackup = (Get-Date).AddMinutes(5)
                   }
-
-                  if (((Get-Date) - $StartedAt) -ge $MaximumRuntime) {
-                      Write-Host "Maximum runtime reached. Stopping Minecraft."
-                      break
-                  }
               }
 
-              if ($script:MinecraftProcess.HasExited) {
-                  Write-Warning "Minecraft server has stopped."
-              }
+              Write-Host "Maximum runtime reached."
           }
           finally {
-              if ($script:MinecraftProcess -and !$script:MinecraftProcess.HasExited) {
-                  try {
-                      Write-Host "Sending graceful stop command..."
-                      $script:MinecraftProcess.StandardInput.WriteLine("stop")
+              Write-Host "Preparing final Minecraft shutdown..."
 
-                      if (!$script:MinecraftProcess.WaitForExit(90000)) {
-                          Write-Warning "Minecraft did not stop in time. Terminating process."
-                          $script:MinecraftProcess.Kill($true)
-                          $script:MinecraftProcess.WaitForExit()
-                      }
-                  }
-                  catch {
-                      Write-Warning "Could not stop Minecraft gracefully: $_"
-                  }
+              try {
+                  Invoke-RconCommand "stop" | Out-Null
+                  Write-Host "Stop command sent."
+
+                  $Deadline = (Get-Date).AddSeconds(90)
+
+                  do {
+                      Start-Sleep -Seconds 3
+
+                      $Listener = Get-NetTCPConnection `
+                        -LocalPort 25575 `
+                        -State Listen `
+                        -ErrorAction SilentlyContinue
+
+                  } while ($Listener -and (Get-Date) -lt $Deadline)
+
+                  $Stopped = !$Listener
+              }
+              catch {
+                  $Stopped = $false
+                  Write-Host "Minecraft was not running or RCON was unavailable."
               }
 
               try {
-                  Save-MinecraftBackup
+                  if ($Stopped) {
+                      Save-MinecraftBackup -ServerStopped
+                  }
+                  else {
+                      Save-MinecraftBackup
+                  }
               }
               catch {
                   Write-Warning "Final backup failed: $_"
               }
 
-              if ($script:MinecraftProcess) {
-                  $script:MinecraftProcess.Dispose()
-              }
-
-              Write-Host "Minecraft job finished."
+              Write-Host "Workflow cleanup finished."
           }
