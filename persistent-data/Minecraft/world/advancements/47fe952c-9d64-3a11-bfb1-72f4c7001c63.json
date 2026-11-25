@@ -11,5 +11,23 @@
     },
     "done": false
   },
+  "minecraft:recipes/building_blocks/birch_planks": {
+    "criteria": {
+      "has_logs": "2026-11-25 16:01:38 +0000"
+    },
+    "done": true
+  },
+  "minecraft:recipes/misc/charcoal": {
+    "criteria": {
+      "has_log": "2026-11-25 16:01:38 +0000"
+    },
+    "done": true
+  },
+  "minecraft:recipes/building_blocks/birch_wood": {
+    "criteria": {
+      "has_log": "2026-11-25 16:01:38 +0000"
+    },
+    "done": true
+  },
   "DataVersion": 3465
 }
