@@ -1,1 +1,387 @@
-name: Windows RDP + Minecraft Forge + Playiton:  workflow_dispatch:  permissions:  contents: write  jobs:  build:      runs-on: windows-latest        timeout-minutes: 360        steps:          - name: Checkout Repository              uses: actions/checkout@v4              - name: Restore Minecraft Files              shell: pwsh                run: |                  $b="$env:GITHUB_WORKSPACE\persistent-data\Minecraft"; $s="C:\RDP-Persistent\Minecraft"                    New-Item -ItemType Directory -Force $s|Out-Null                    if(Test-Path $b){try{Copy-Item "$b\*" $s -Recurse -Force -ErrorAction Stop}catch{Write-Warning $_}}                    exit 0                - name: Install Java 17              uses: actions/setup-java@v4                with:                  distribution: temurin                    java-version: '17'                - name: Install Minecraft Forge              shell: pwsh                run: |                  $s='C:\RDP-Persistent\Minecraft'; New-Item -ItemType Directory -Force $s|Out-Null; Set-Location $s                    if(!(Test-Path run.bat)){Invoke-WebRequest 'https://maven.minecraftforge.net/net/minecraftforge/forge/1.20.1-47.4.10/forge-1.20.1-47.4.10-installer.jar' -OutFile forge.jar;java -jar forge.jar --installServer}                    Set-Content eula.txt 'eula=true'                - name: Create Admin Account              shell: pwsh                env:                  RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}                  run: |                  $p=ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force                    if(!(Get-LocalUser NvDAdmin -ErrorAction SilentlyContinue)){New-LocalUser NvDAdmin -Password $p -PasswordNeverExpires}                    Add-LocalGroupMember Administrators NvDAdmin -ErrorAction SilentlyContinue                - name: Install Tailscale              shell: pwsh                env:                  TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}                  run: |                  Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile C:\ts.msi                    Start-Process msiexec -ArgumentList '/i C:\ts.msi /quiet /norestart' -Wait;Start-Sleep 5                    & 'C:\Program Files\Tailscale\tailscale.exe' up --authkey="$env:TAILSCALE_AUTHKEY" --hostname=github-rdp-server;Start-Sleep 8                    Write-Host "Tailscale IP: $(& 'C:\Program Files\Tailscale\tailscale.exe' ip -4)";Write-Host 'Username: NvDAdmin'                - name: Start Playit Agent              shell: pwsh                env:                  PLAYIT_SECRET_KEY: ${{ secrets.PLAYIT_SECRET_KEY }}                  run: |                  Invoke-WebRequest 'https://github.com/playit-cloud/playit-agent/releases/download/v2.0.2/playitd-windows-x86_64.exe' -OutFile C:\playitd.exe                    $p=Start-Process C:\playitd.exe -ArgumentList @('--secret',$env:PLAYIT_SECRET_KEY) -PassThru -WindowStyle Hidden;Start-Sleep 12                    if($p.HasExited){throw 'Playit failed'};Write-Host 'Playit Agent started!'                - name: Start Minecraft and Auto Backup              shell: pwsh                run: |                  $s='C:\RDP-Persistent\Minecraft';$b="$env:GITHUB_WORKSPACE\persistent-data\Minecraft";Set-Location $s                    $p=Start-Process cmd.exe -ArgumentList '/c run.bat nogui' -WorkingDirectory $s -PassThru;Write-Host 'Minecraft Forge Started!'                    for($i=1;$i-le 330;$i++){Start-Sleep 60;if($p.HasExited){break};if($i%5-eq 0){Write-Host "[$i/330] Server running...";Copy-Item "$s\*" $b -Recurse -Force -Exclude logs,crash-reports -ErrorAction SilentlyContinue}}                - name: Keep Runner Alive              if: always()                shell: pwsh                run: Start-Sleep -Seconds 172800
+name: Windows RDP + Minecraft Forge + Playit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: minecraft-server
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Restore Minecraft Files
+        shell: pwsh
+        run: |
+          $Backup = "$env:GITHUB_WORKSPACE\persistent-data\Minecraft"
+          $Server = "C:\RDP-Persistent\Minecraft"
+
+          New-Item -ItemType Directory -Force -Path $Server | Out-Null
+
+          if (Test-Path $Backup) {
+              robocopy $Backup $Server /E /R:2 /W:2
+
+              if ($LASTEXITCODE -ge 8) {
+                  throw "Minecraft restore failed."
+              }
+
+              Write-Host "Minecraft backup restored."
+          }
+          else {
+              Write-Host "No previous backup found."
+          }
+
+      - name: Install Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Minecraft Forge
+        shell: pwsh
+        run: |
+          $Server = "C:\RDP-Persistent\Minecraft"
+
+          New-Item -ItemType Directory -Force -Path $Server | Out-Null
+          Set-Location $Server
+
+          if (!(Test-Path "$Server\run.bat")) {
+
+              $Installer = "$Server\forge-installer.jar"
+
+              Invoke-WebRequest `
+                -Uri "https://maven.minecraftforge.net/net/minecraftforge/forge/1.20.1-47.4.10/forge-1.20.1-47.4.10-installer.jar" `
+                -OutFile $Installer
+
+              java -jar $Installer --installServer
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Forge installation failed."
+              }
+          }
+
+          if (!(Test-Path "$Server\run.bat")) {
+              throw "Forge run.bat not found."
+          }
+
+          Set-Content -Path "$Server\eula.txt" -Value "eula=true"
+
+          Write-Host "Forge installation completed."
+
+      - name: Enable Remote Desktop
+        shell: pwsh
+        run: |
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
+
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale-Only" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any
+
+          Write-Host "RDP enabled."
+
+      - name: Create or Update Admin Account
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              throw "RDP_PASSWORD secret is missing."
+          }
+
+          $Password = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          $User = Get-LocalUser `
+            -Name "NvDAdmin" `
+            -ErrorAction SilentlyContinue
+
+          if (!$User) {
+              New-LocalUser `
+                -Name "NvDAdmin" `
+                -Password $Password `
+                -PasswordNeverExpires
+          }
+          else {
+              Set-LocalUser `
+                -Name "NvDAdmin" `
+                -Password $Password
+
+              Enable-LocalUser -Name "NvDAdmin"
+          }
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "NvDAdmin" `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Administrator account ready."
+
+      - name: Install and Connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+              throw "TAILSCALE_AUTHKEY is missing."
+          }
+
+          $Installer = "C:\tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $Installer
+
+          $Process = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList "/i `"$Installer`" /quiet /norestart" `
+            -Wait `
+            -PassThru
+
+          if ($Process.ExitCode -ne 0) {
+              throw "Tailscale installation failed."
+          }
+
+          $Tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          if (!(Test-Path $Tailscale)) {
+              throw "Tailscale executable not found."
+          }
+
+          & $Tailscale up `
+            --authkey="$env:TAILSCALE_AUTHKEY" `
+            --hostname="github-rdp-server"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale connection failed."
+          }
+
+          Start-Sleep -Seconds 5
+
+          $IP = & $Tailscale ip -4
+
+          if (!$IP) {
+              throw "Tailscale IP unavailable."
+          }
+
+          Write-Host "================================"
+          Write-Host "RDP SERVER READY"
+          Write-Host "IP: $IP"
+          Write-Host "Username: NvDAdmin"
+          Write-Host "Port: 3389"
+          Write-Host "================================"
+
+      - name: Install and Start Playit
+        shell: pwsh
+        env:
+          PLAYIT_SECRET_KEY: ${{ secrets.PLAYIT_SECRET_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PLAYIT_SECRET_KEY)) {
+              throw "PLAYIT_SECRET_KEY is missing."
+          }
+
+          $Agent = "C:\playit-windows-x86_64.exe"
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/playit-cloud/playit-agent/releases/download/v2.0.2/playit-windows-x86_64.exe" `
+            -OutFile $Agent
+
+          if (!(Test-Path $Agent)) {
+              throw "Playit download failed."
+          }
+
+          $Playit = Start-Process `
+            -FilePath $Agent `
+            -ArgumentList @($env:PLAYIT_SECRET_KEY) `
+            -PassThru `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput "C:\playit-output.log" `
+            -RedirectStandardError "C:\playit-error.log"
+
+          Start-Sleep -Seconds 15
+
+          if ($Playit.HasExited) {
+              Get-Content "C:\playit-error.log" `
+                -ErrorAction SilentlyContinue
+
+              throw "Playit failed to start."
+          }
+
+          Write-Host "Playit Agent started."
+
+      - name: Start Minecraft Server
+        shell: pwsh
+        run: |
+          $Server = "C:\RDP-Persistent\Minecraft"
+
+          Set-Location $Server
+
+          if (!(Test-Path "$Server\run.bat")) {
+              throw "Minecraft run.bat not found."
+          }
+
+          $StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+
+          $StartInfo.FileName = "cmd.exe"
+          $StartInfo.Arguments = "/c run.bat nogui"
+          $StartInfo.WorkingDirectory = $Server
+          $StartInfo.UseShellExecute = $false
+          $StartInfo.RedirectStandardInput = $true
+          $StartInfo.RedirectStandardOutput = $true
+          $StartInfo.RedirectStandardError = $true
+          $StartInfo.CreateNoWindow = $true
+
+          $Minecraft = New-Object System.Diagnostics.Process
+          $Minecraft.StartInfo = $StartInfo
+
+          $Minecraft.Start() | Out-Null
+
+          Write-Host "Minecraft Forge started."
+
+          function Save-Backup {
+
+              $Backup = "$env:GITHUB_WORKSPACE\persistent-data\Minecraft"
+
+              New-Item -ItemType Directory -Force -Path $Backup | Out-Null
+
+              try {
+
+                  if (!$Minecraft.HasExited) {
+                      $Minecraft.StandardInput.WriteLine("save-all flush")
+                      $Minecraft.StandardInput.Flush()
+
+                      Start-Sleep -Seconds 5
+                  }
+
+                  robocopy `
+                    $Server `
+                    $Backup `
+                    /MIR `
+                    /R:2 `
+                    /W:2 `
+                    /XD "$Server\logs" "$Server\crash-reports"
+
+                  $Code = $LASTEXITCODE
+
+                  if ($Code -ge 8) {
+                      throw "Robocopy failed: $Code"
+                  }
+
+                  $global:LASTEXITCODE = 0
+
+                  git config user.name "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+                  git add -A -- persistent-data/Minecraft
+
+                  git diff --cached --quiet
+
+                  if ($LASTEXITCODE -ne 0) {
+
+                      git commit -m "Update Minecraft backup"
+
+                      if ($LASTEXITCODE -ne 0) {
+                          throw "Git commit failed."
+                      }
+
+                      git push origin "HEAD:$env:GITHUB_REF_NAME"
+
+                      if ($LASTEXITCODE -ne 0) {
+                          throw "Git push failed."
+                      }
+
+                      Write-Host "Backup pushed to GitHub."
+                  }
+                  else {
+                      Write-Host "No backup changes."
+                  }
+
+                  $global:LASTEXITCODE = 0
+
+              }
+              catch {
+                  Write-Warning "Backup error: $($_.Exception.Message)"
+                  $global:LASTEXITCODE = 0
+              }
+          }
+
+          try {
+
+              for ($i = 1; $i -le 330; $i++) {
+
+                  Start-Sleep -Seconds 60
+
+                  if ($Minecraft.HasExited) {
+                      Write-Host "Minecraft stopped."
+                      break
+                  }
+
+                  if (($i % 5) -eq 0) {
+                      Write-Host "Server running: $i/330 minutes"
+                      Save-Backup
+                  }
+
+              }
+
+          }
+          finally {
+
+              if (!$Minecraft.HasExited) {
+
+                  Write-Host "Stopping Minecraft..."
+
+                  $Minecraft.StandardInput.WriteLine("stop")
+                  $Minecraft.StandardInput.Flush()
+
+                  if (!$Minecraft.WaitForExit(90000)) {
+                      Write-Warning "Minecraft did not stop gracefully."
+                      $Minecraft.Kill()
+                      $Minecraft.WaitForExit()
+                  }
+              }
+
+              Write-Host "Creating final backup..."
+
+              Save-Backup
+
+              Write-Host "Minecraft shutdown completed."
+          }
+
+      - name: Runner Status
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "Workflow finished."
