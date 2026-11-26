@@ -267,7 +267,8 @@ jobs:
                 Write-Host "All SHA256 checks passed."
               }
               else {
-                Write-Warning "SHA256 manifest missing. Trying legacy backup."
+                Write-Warning "SHA256 manifest missing. Checking legacy backup."
+
                 if ($ZipFiles.Count -ne 1 -or $ZipFiles[0].Name -ne "Minecraft-EmergencyBackup.zip") {
                   continue
                 }
@@ -301,9 +302,6 @@ jobs:
                 continue
               }
 
-              # Legacy backup: the ZIP contained desktop files directly.
-              $LegacyZip = Test-Path (Join-Path $ExtractDir "Minecraft-EmergencyBackup.zip")
-
               if ((Test-Path (Join-Path $ExtractDir "Desktop")) -or
                   (Test-Path (Join-Path $ExtractDir "AppData")) -or
                   (Test-Path (Join-Path $ExtractDir "ProgramData"))) {
@@ -323,7 +321,7 @@ jobs:
                     New-Item -ItemType Directory -Force -Path $Mapping.Destination | Out-Null
 
                     robocopy $Mapping.Source $Mapping.Destination `
-                      /E /COPY:DAT /DCOPY:DAT /R:2 /W:2 /XJ /SL
+                      /E /COPY:DAT /DCOPY:DAT /R:5 /W:3 /XJ /SL
 
                     $CopyCode = $LASTEXITCODE
                     $global:LASTEXITCODE = 0
@@ -342,7 +340,7 @@ jobs:
                   New-Item -ItemType Directory -Force -Path $RegistryDestination | Out-Null
 
                   robocopy $RegistrySource $RegistryDestination `
-                    /E /COPY:DAT /DCOPY:DAT /R:2 /W:2
+                    /E /COPY:DAT /DCOPY:DAT /R:5 /W:3
 
                   $CopyCode = $LASTEXITCODE
                   $global:LASTEXITCODE = 0
@@ -353,9 +351,8 @@ jobs:
                 }
               }
               else {
-                # Previous workflow backup: entire desktop at ZIP root.
                 robocopy $ExtractDir $env:DESKTOP_DIR `
-                  /E /COPY:DAT /DCOPY:DAT /R:2 /W:2 /XJ /SL
+                  /E /COPY:DAT /DCOPY:DAT /R:5 /W:3 /XJ /SL
 
                 $CopyCode = $LASTEXITCODE
                 $global:LASTEXITCODE = 0
@@ -691,17 +688,20 @@ jobs:
 
           $BackupRoot = "$env:RUNNER_TEMP\FullEmergencyBackup"
           $ZipDir = "$env:RUNNER_TEMP\BackupArchives"
+          $LogDir = "$env:RUNNER_TEMP\BackupLogs"
           $ShaPath = "$env:RUNNER_TEMP\Minecraft-EmergencyBackup.sha256"
 
           Remove-Item $BackupRoot -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item $ZipDir -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $LogDir -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item $ShaPath -Force -ErrorAction SilentlyContinue
 
           New-Item -ItemType Directory -Force -Path $BackupRoot | Out-Null
           New-Item -ItemType Directory -Force -Path $ZipDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
           # ============================================
-          # ROBOCOPY HELPER
+          # ROBUST ROBOCOPY HELPER
           # ============================================
 
           function Copy-BackupFolder {
@@ -712,8 +712,10 @@ jobs:
             )
 
             Write-Host ""
+            Write-Host "======================================"
             Write-Host "Backing up: $Label"
             Write-Host "Source: $Source"
+            Write-Host "======================================"
 
             if (!(Test-Path $Source)) {
               Write-Warning "Source does not exist: $Source"
@@ -723,17 +725,37 @@ jobs:
 
             New-Item -ItemType Directory -Force -Path $Destination | Out-Null
 
+            $SafeLabel = $Label -replace '[^a-zA-Z0-9_-]', '_'
+            $LogFile = Join-Path $LogDir "$SafeLabel.log"
+
             robocopy $Source $Destination `
-              /E /COPY:DAT /DCOPY:DAT /R:2 /W:2 /XJ /SL
+              /E /COPY:DAT /DCOPY:DAT `
+              /ZB /R:5 /W:3 /XJ /SL `
+              /V /FP /TS `
+              /TEE "/LOG:$LogFile"
 
             $CopyCode = $LASTEXITCODE
             $global:LASTEXITCODE = 0
 
+            Write-Host ""
             Write-Host "$Label Robocopy code: $CopyCode"
+            Write-Host "Log: $LogFile"
 
             if ($CopyCode -ge 8) {
-              throw "$Label backup failed. Robocopy code: $CopyCode"
+              Write-Warning "Robocopy reported errors for $Label."
+
+              Write-Host "Failed file details:"
+
+              Get-Content $LogFile |
+                Select-String -Pattern 'ERROR|Access is denied|The process cannot access|FAILED|ERROR [0-9]+' |
+                ForEach-Object {
+                  Write-Host $_.Line
+                }
+
+              throw "$Label backup failed. Robocopy code: $CopyCode. Check log: $LogFile"
             }
+
+            Write-Host "$Label backup completed."
           }
 
           # ============================================
@@ -752,17 +774,17 @@ jobs:
           Copy-BackupFolder `
             "$env:PROFILE_DIR\AppData\Roaming" `
             "$BackupRoot\AppData\Roaming" `
-            "AppData Roaming"
+            "AppData_Roaming"
 
           Copy-BackupFolder `
             "$env:PROFILE_DIR\AppData\Local" `
             "$BackupRoot\AppData\Local" `
-            "AppData Local"
+            "AppData_Local"
 
           Copy-BackupFolder `
             "$env:PROFILE_DIR\AppData\LocalLow" `
             "$BackupRoot\AppData\LocalLow" `
-            "AppData LocalLow"
+            "AppData_LocalLow"
 
           # ============================================
           # PROGRAM DATA
@@ -774,7 +796,7 @@ jobs:
             "ProgramData"
 
           # ============================================
-          # USER DOCUMENTS
+          # DOCUMENTS
           # ============================================
 
           Copy-BackupFolder `
@@ -789,7 +811,7 @@ jobs:
           Copy-BackupFolder `
             "$env:PROFILE_DIR\Saved Games" `
             "$BackupRoot\Saved Games" `
-            "Saved Games"
+            "Saved_Games"
 
           # ============================================
           # REGISTRY BACKUP
@@ -814,7 +836,8 @@ jobs:
           $HiveName = "HKU\$UserSID"
           $TemporaryHive = $false
 
-          $LoadedHive = & reg.exe query $HiveName 2>$null
+          & reg.exe query $HiveName 2>$null
+
           $LoadedCode = $LASTEXITCODE
           $global:LASTEXITCODE = 0
 
@@ -882,7 +905,16 @@ jobs:
           Write-Host "Registry export completed."
 
           # ============================================
-          # CREATE SEPARATE ZIP ARCHIVES
+          # ADD LOGS TO BACKUP
+          # ============================================
+
+          Copy-BackupFolder `
+            "$LogDir" `
+            "$BackupRoot\Logs" `
+            "Backup_Logs"
+
+          # ============================================
+          # CREATE ZIP ARCHIVES
           # ============================================
 
           Write-Host ""
@@ -896,7 +928,8 @@ jobs:
             "ProgramData",
             "Documents",
             "Saved Games",
-            "Registry"
+            "Registry",
+            "Logs"
           )
 
           $ArchiveNames = @()
@@ -962,7 +995,7 @@ jobs:
             $Assets `
             --repo $Repository `
             --title "Minecraft Full Emergency Backup" `
-            --notes "Full backup of Desktop, Minecraft, AppData, ProgramData, Documents, Saved Games and registry exports."
+            --notes "Full backup of Desktop, Minecraft, AppData, ProgramData, Documents, Saved Games, Registry and backup logs."
 
           $ReleaseCode = $LASTEXITCODE
           $global:LASTEXITCODE = 0
