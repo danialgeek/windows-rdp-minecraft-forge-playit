@@ -1,5 +1,5 @@
 
-name: Windows RDP + Minecraft Forge + 3X-UI VLESS REALITY + Bore + Full Backup
+name: Windows RDP + Minecraft Forge + 3X-UI VLESS REALITY + Bore + Desktop and Browser Backup
 
 on:
   workflow_dispatch:
@@ -139,7 +139,7 @@ jobs:
       # 4. RESTORE LATEST BACKUP
       # ================================================
 
-      - name: Restore latest full backup
+      - name: Restore latest Desktop and browser backup
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -191,7 +191,15 @@ jobs:
               New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
               New-Item -ItemType Directory -Force -Path $ExtractDir | Out-Null
 
-              gh release download $Tag --repo $Repository --dir $DownloadDir
+              gh release download $Tag --repo $Repository --dir $DownloadDir `
+                --pattern "Desktop.zip" `
+                --pattern "Desktop.zip.part*" `
+                --pattern "Browsers-Chrome.zip" `
+                --pattern "Browsers-Chrome.zip.part*" `
+                --pattern "Browsers-Edge.zip" `
+                --pattern "Browsers-Edge.zip.part*" `
+                --pattern "AppData-Local.zip" `
+                --pattern "Minecraft-EmergencyBackup.sha256"
 
               $Code = $LASTEXITCODE
               $global:LASTEXITCODE = 0
@@ -200,7 +208,42 @@ jobs:
                 continue
               }
 
-              $ZipFiles = @(Get-ChildItem $DownloadDir -Filter "*.zip" -File)
+              # Reassemble every split ZIP archive. This supports the current
+              # Desktop/Chrome/Edge backup and older ProgramData split backups.
+              $SplitFiles = @(
+                Get-ChildItem $DownloadDir -File | Where-Object {
+                  $_.Name -match '^(.+\.zip)\.part[0-9]+$'
+                }
+              )
+
+              $SplitGroups = @($SplitFiles | Group-Object {
+                [regex]::Match($_.Name, '^(.+\.zip)\.part[0-9]+$').Groups[1].Value
+              })
+
+              foreach ($Group in $SplitGroups) {
+                $CombinedPath = Join-Path $DownloadDir $Group.Name
+                if (Test-Path $CombinedPath) {
+                  Remove-Item $CombinedPath -Force
+                }
+
+                $OutputStream = [System.IO.File]::Open($CombinedPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                try {
+                  foreach ($Part in @($Group.Group | Sort-Object Name)) {
+                    $InputStream = [System.IO.File]::OpenRead($Part.FullName)
+                    try { $InputStream.CopyTo($OutputStream) }
+                    finally { $InputStream.Dispose() }
+                  }
+                }
+                finally { $OutputStream.Dispose() }
+
+                Write-Host "Reassembled $($Group.Name) from $($Group.Count) parts."
+              }
+
+              $ZipFiles = @(
+                Get-ChildItem $DownloadDir -Filter "*.zip" -File | Where-Object {
+                  $_.Name -in @("Desktop.zip", "Browsers-Chrome.zip", "Browsers-Edge.zip", "AppData-Local.zip")
+                }
+              )
 
               if ($ZipFiles.Count -eq 0) {
                 continue
@@ -223,15 +266,25 @@ jobs:
 
               $Valid = $true
 
-              foreach ($Zip in $ZipFiles) {
-                if (!$HashMap.ContainsKey($Zip.Name)) {
+              # Verify every original ZIP and every uploaded split part.
+              # A reassembled ZIP is validated through its individually
+              # verified parts, because the combined file has no manifest entry.
+              $AssetsToVerify = @(
+                Get-ChildItem $DownloadDir -File | Where-Object {
+                  $_.Name -match '^.+\.zip\.part[0-9]+$' -or
+                  ($_.Extension -eq ".zip" -and !(Test-Path (Join-Path $DownloadDir ($_.Name + ".part001"))))
+                }
+              )
+
+              foreach ($Asset in $AssetsToVerify) {
+                if (!$HashMap.ContainsKey($Asset.Name)) {
                   $Valid = $false
                   break
                 }
 
-                $Actual = (Get-FileHash $Zip.FullName -Algorithm SHA256).Hash
+                $Actual = (Get-FileHash $Asset.FullName -Algorithm SHA256).Hash
 
-                if ($Actual -ne $HashMap[$Zip.Name]) {
+                if ($Actual -ne $HashMap[$Asset.Name]) {
                   $Valid = $false
                   break
                 }
@@ -264,62 +317,42 @@ jobs:
                 continue
               }
 
+              # Restore only the requested data: Desktop (including Minecraft)
+              # and Chrome/Edge browser profiles. For compatibility with older
+              # releases, browser profiles are also located inside old AppData zips.
               $Mappings = @(
                 @{ Source = "$ExtractDir\Desktop"; Destination = $env:DESKTOP_DIR },
-                @{ Source = "$ExtractDir\AppData\Roaming"; Destination = "$env:PROFILE_DIR\AppData\Roaming" },
-                @{ Source = "$ExtractDir\AppData\Local"; Destination = "$env:PROFILE_DIR\AppData\Local" },
-                @{ Source = "$ExtractDir\AppData\LocalLow"; Destination = "$env:PROFILE_DIR\AppData\LocalLow" },
-                @{ Source = "$ExtractDir\ProgramData"; Destination = "C:\ProgramData" },
-                @{ Source = "$ExtractDir\Documents"; Destination = "$env:PROFILE_DIR\Documents" },
-                @{ Source = "$ExtractDir\Saved Games"; Destination = "$env:PROFILE_DIR\Saved Games" }
+                @{ Source = "$ExtractDir\Browsers\Chrome\User Data"; Destination = "$env:PROFILE_DIR\AppData\Local\Google\Chrome\User Data" },
+                @{ Source = "$ExtractDir\Browsers\Edge\User Data"; Destination = "$env:PROFILE_DIR\AppData\Local\Microsoft\Edge\User Data" },
+                @{ Source = "$ExtractDir\AppData\Local\Google\Chrome\User Data"; Destination = "$env:PROFILE_DIR\AppData\Local\Google\Chrome\User Data" },
+                @{ Source = "$ExtractDir\AppData\Local\Microsoft\Edge\User Data"; Destination = "$env:PROFILE_DIR\AppData\Local\Microsoft\Edge\User Data" }
               )
 
               $HasStructuredBackup = (
                 (Test-Path "$ExtractDir\Desktop") -or
-                (Test-Path "$ExtractDir\AppData") -or
-                (Test-Path "$ExtractDir\ProgramData")
+                (Test-Path "$ExtractDir\Browsers") -or
+                (Test-Path "$ExtractDir\AppData\Local\Google\Chrome\User Data") -or
+                (Test-Path "$ExtractDir\AppData\Local\Microsoft\Edge\User Data")
               )
 
-              if ($HasStructuredBackup) {
-                foreach ($Mapping in $Mappings) {
-                  if (Test-Path $Mapping.Source) {
-                    New-Item -ItemType Directory -Force -Path $Mapping.Destination | Out-Null
+              if (!$HasStructuredBackup) {
+                Write-Warning "This release does not contain Desktop or Chrome/Edge browser data. Trying the next backup release."
+                continue
+              }
 
-                    robocopy $Mapping.Source $Mapping.Destination `
-                      /E /COPY:DAT /DCOPY:DAT /R:3 /W:2 /XJ
+              foreach ($Mapping in $Mappings) {
+                if (Test-Path $Mapping.Source) {
+                  New-Item -ItemType Directory -Force -Path $Mapping.Destination | Out-Null
 
-                    $CopyCode = $LASTEXITCODE
-                    $global:LASTEXITCODE = 0
-
-                    if ($CopyCode -ge 8) {
-                      throw "Restore failed: $($Mapping.Source), code $CopyCode"
-                    }
-                  }
-                }
-
-                if (Test-Path "$ExtractDir\Registry") {
-                  $RegistryDestination = Join-Path $env:DESKTOP_DIR "Registry-Backup-For-Manual-Restore"
-
-                  New-Item -ItemType Directory -Force -Path $RegistryDestination | Out-Null
-
-                  robocopy "$ExtractDir\Registry" $RegistryDestination /E /R:3 /W:2
+                  robocopy $Mapping.Source $Mapping.Destination `
+                    /E /COPY:DAT /DCOPY:DAT /R:3 /W:2 /XJ
 
                   $CopyCode = $LASTEXITCODE
                   $global:LASTEXITCODE = 0
 
                   if ($CopyCode -ge 8) {
-                    throw "Registry restore failed."
+                    throw "Restore failed: $($Mapping.Source), code $CopyCode"
                   }
-                }
-              }
-              else {
-                robocopy $ExtractDir $env:DESKTOP_DIR /E /R:3 /W:2 /XJ
-
-                $CopyCode = $LASTEXITCODE
-                $global:LASTEXITCODE = 0
-
-                if ($CopyCode -ge 8) {
-                  throw "Legacy restore failed."
                 }
               }
 
@@ -425,6 +458,8 @@ jobs:
 
       - name: Install 3X-UI Windows, enable panel TLS, and start panel
         shell: pwsh
+        env:
+          RUNNER_TRACKING_ID: ""
         run: |
           $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
@@ -637,6 +672,8 @@ jobs:
 
       - name: Start Bore RDP and VLESS REALITY tunnels
         shell: pwsh
+        env:
+          RUNNER_TRACKING_ID: ""
         run: |
           $ErrorActionPreference = "Stop"
           $Bore = $env:BORE_EXE
@@ -893,7 +930,7 @@ jobs:
       # 8. STOP SERVER + FULL BACKUP
       # ================================================
 
-      - name: Stop Minecraft and create full emergency backup
+      - name: Stop Minecraft and back up Desktop, Chrome and Edge
         if: always()
         shell: pwsh
         run: |
@@ -1102,7 +1139,8 @@ jobs:
             param(
               [string]$Source,
               [string]$Destination,
-              [string]$Label
+              [string]$Label,
+              [string[]]$ExcludeDirs = @()
             )
 
             Write-Host ""
@@ -1110,6 +1148,7 @@ jobs:
 
             if (!(Test-Path $Source)) {
               Write-Warning "Folder does not exist: $Source"
+              Add-BackupError "$Label source folder does not exist. No data was available to back up."
               New-Item -ItemType Directory -Force -Path $Destination | Out-Null
               return
             }
@@ -1119,10 +1158,19 @@ jobs:
             $SafeLabel = $Label -replace '[^a-zA-Z0-9_-]', '_'
             $LogFile = Join-Path $LogDir "$SafeLabel.log"
 
-            & robocopy.exe $Source $Destination `
-              /E /COPY:DAT /DCOPY:DAT `
-              /ZB /R:3 /W:2 /XJ `
+            $RobocopyArgs = @(
+              $Source, $Destination,
+              "/E", "/COPY:DAT", "/DCOPY:DAT",
+              "/ZB", "/R:3", "/W:2", "/XJ",
               "/LOG:$LogFile"
+            )
+
+            if ($ExcludeDirs.Count -gt 0) {
+              $RobocopyArgs += "/XD"
+              $RobocopyArgs += $ExcludeDirs
+            }
+
+            & robocopy.exe @RobocopyArgs
 
             $CopyCode = $LASTEXITCODE
             $global:LASTEXITCODE = 0
@@ -1144,17 +1192,36 @@ jobs:
           }
 
           # ============================================
-          # BACKUP FOLDERS
+          # CLOSE BROWSERS BEFORE COPYING THEIR PROFILE DATABASES
           # ============================================
 
+          foreach ($ProcessName in @("chrome", "msedge")) {
+            $BrowserProcesses = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
+            if ($BrowserProcesses.Count -gt 0) {
+              Write-Host "Closing $ProcessName before browser profile backup..."
+              foreach ($BrowserProcess in $BrowserProcesses) {
+                try { [void]$BrowserProcess.CloseMainWindow() } catch { }
+              }
+              Start-Sleep -Seconds 8
+              Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
+                Stop-Process -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          # ============================================
+          # BACKUP ONLY DESKTOP + CHROME + EDGE
+          # ============================================
+
+          $BrowserExcludedDirs = @(
+            "Cache", "Code Cache", "GPUCache", "GrShaderCache",
+            "ShaderCache", "DawnCache", "CacheStorage", "Crashpad",
+            "BrowserMetrics"
+          )
+
           $Mappings = @(
-            @{ Source = $env:DESKTOP_DIR; Destination = "$BackupRoot\Desktop"; Label = "Desktop" },
-            @{ Source = "$env:PROFILE_DIR\AppData\Roaming"; Destination = "$BackupRoot\AppData\Roaming"; Label = "AppData_Roaming" },
-            @{ Source = "$env:PROFILE_DIR\AppData\Local"; Destination = "$BackupRoot\AppData\Local"; Label = "AppData_Local" },
-            @{ Source = "$env:PROFILE_DIR\AppData\LocalLow"; Destination = "$BackupRoot\AppData\LocalLow"; Label = "AppData_LocalLow" },
-            @{ Source = "C:\ProgramData"; Destination = "$BackupRoot\ProgramData"; Label = "ProgramData" },
-            @{ Source = "$env:PROFILE_DIR\Documents"; Destination = "$BackupRoot\Documents"; Label = "Documents" },
-            @{ Source = "$env:PROFILE_DIR\Saved Games"; Destination = "$BackupRoot\Saved Games"; Label = "Saved_Games" }
+            @{ Source = $env:DESKTOP_DIR; Destination = "$BackupRoot\Desktop"; Label = "Desktop"; ExcludeDirs = @() },
+            @{ Source = "$env:PROFILE_DIR\AppData\Local\Google\Chrome\User Data"; Destination = "$BackupRoot\Browsers\Chrome\User Data"; Label = "Chrome_Browser_Data"; ExcludeDirs = $BrowserExcludedDirs },
+            @{ Source = "$env:PROFILE_DIR\AppData\Local\Microsoft\Edge\User Data"; Destination = "$BackupRoot\Browsers\Edge\User Data"; Label = "Edge_Browser_Data"; ExcludeDirs = $BrowserExcludedDirs }
           )
 
           foreach ($Mapping in $Mappings) {
@@ -1162,119 +1229,28 @@ jobs:
               Copy-BackupFolder `
                 $Mapping.Source `
                 $Mapping.Destination `
-                $Mapping.Label
+                $Mapping.Label `
+                $Mapping.ExcludeDirs
             }
             catch {
               Add-BackupError "$($Mapping.Label): $($_.Exception.Message)"
             }
           }
 
-          # ============================================
-          # REGISTRY BACKUP
-          # ============================================
-
-          try {
-            Write-Host "Exporting registry..."
-
-            $RegistryDir = "$BackupRoot\Registry"
-            New-Item -ItemType Directory -Force -Path $RegistryDir | Out-Null
-
-            $Profile = Get-CimInstance Win32_UserProfile |
-              Where-Object { $_.LocalPath -eq $env:PROFILE_DIR } |
-              Select-Object -First 1
-
-            if ($null -eq $Profile) {
-              throw "Could not find NvDAdmin profile SID."
-            }
-
-            $HiveName = "HKU\$($Profile.SID)"
-            $TemporaryHive = $false
-
-            & reg.exe query $HiveName 2>$null
-
-            $Code = $LASTEXITCODE
-            $global:LASTEXITCODE = 0
-
-            if ($Code -ne 0) {
-              $NtUser = Join-Path $env:PROFILE_DIR "NTUSER.DAT"
-
-              if (!(Test-Path $NtUser)) {
-                throw "NTUSER.DAT not found."
-              }
-
-              & reg.exe load "HKU\NvDAdminBackupTemp" $NtUser
-
-              $Code = $LASTEXITCODE
-              $global:LASTEXITCODE = 0
-
-              if ($Code -ne 0) {
-                throw "Could not load user registry hive."
-              }
-
-              $HiveName = "HKU\NvDAdminBackupTemp"
-              $TemporaryHive = $true
-            }
-
-            try {
-              & reg.exe export $HiveName "$RegistryDir\NvDAdmin-User-Registry.reg" /y
-
-              $Code = $LASTEXITCODE
-              $global:LASTEXITCODE = 0
-
-              if ($Code -ne 0) {
-                throw "User registry export failed."
-              }
-            }
-            finally {
-              if ($TemporaryHive) {
-                & reg.exe unload "HKU\NvDAdminBackupTemp"
-                $global:LASTEXITCODE = 0
-              }
-            }
-
-            & reg.exe export "HKLM\SOFTWARE" "$RegistryDir\HKLM-Software.reg" /y
-
-            $Code = $LASTEXITCODE
-            $global:LASTEXITCODE = 0
-
-            if ($Code -ne 0) {
-              throw "HKLM registry export failed."
-            }
-
-            & reg.exe query "HKLM\SOFTWARE\WOW6432Node" *> $null
-
-            $Code = $LASTEXITCODE
-            $global:LASTEXITCODE = 0
-
-            if ($Code -eq 0) {
-              & reg.exe export "HKLM\SOFTWARE\WOW6432Node" "$RegistryDir\HKLM-WOW6432Node.reg" /y
-
-              $Code = $LASTEXITCODE
-              $global:LASTEXITCODE = 0
-
-              if ($Code -ne 0) {
-                throw "HKLM WOW6432Node registry export failed."
-              }
-            }
-            else {
-              Write-Warning "HKLM\SOFTWARE\WOW6432Node does not exist. Skipping this optional export."
-            }
-
-            Write-Host "Registry export completed."
-          }
-          catch {
-            Add-BackupError "Registry: $($_.Exception.Message)"
-          }
+          # No full AppData, ProgramData, Documents, Saved Games or Registry
+          # export is performed. Only the requested user data is archived.
 
           # ============================================
           # REPORT
           # ============================================
 
           $Report = @(
-            "Minecraft Emergency Backup Report"
+            "Minecraft Desktop + Chrome + Edge Backup Report"
             "Run ID: $env:GITHUB_RUN_ID"
             "Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
             "Repository: $env:GITHUB_REPOSITORY"
+            "Included: Desktop (including Minecraft), Chrome User Data, Edge User Data"
+            "Excluded: full AppData, ProgramData, Documents, Saved Games, Registry and browser cache folders"
             ""
             "Errors: $($script:BackupErrors.Count)"
             ""
@@ -1317,13 +1293,8 @@ jobs:
 
           $Folders = @(
             "Desktop",
-            "AppData\Roaming",
-            "AppData\Local",
-            "AppData\LocalLow",
-            "ProgramData",
-            "Documents",
-            "Saved Games",
-            "Registry",
+            "Browsers\Chrome",
+            "Browsers\Edge",
             "Logs",
             "BackupReport.txt"
           )
@@ -1346,7 +1317,51 @@ jobs:
               throw "Archive creation failed: $ZipName"
             }
 
-            $ArchiveNames += $ZipName
+            # GitHub Releases rejects individual assets >= 2 GiB. Split any
+            # oversized archive into 1.5 GiB chunks, preserving exact ZIP bytes.
+            $ChunkSize = [int64](1536 * 1024 * 1024)
+            $ArchiveLength = (Get-Item $ZipPath).Length
+
+            if ($ArchiveLength -gt $ChunkSize) {
+              Write-Host "$ZipName is $ArchiveLength bytes. Splitting into 1.5 GiB parts."
+              $TemporaryArchive = Join-Path $ZipDir ($ZipName + ".source.tmp")
+              Move-Item $ZipPath $TemporaryArchive -Force
+              $InputStream = [System.IO.File]::OpenRead($TemporaryArchive)
+              try {
+                $PartNumber = 0
+                $Buffer = New-Object byte[] (8MB)
+                while ($true) {
+                  $PartNumber++
+                  $PartName = "$ZipName.part{0:D3}" -f $PartNumber
+                  $PartPath = Join-Path $ZipDir $PartName
+                  $PartStream = [System.IO.File]::Open($PartPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                  $Remaining = $ChunkSize
+                  try {
+                    while ($Remaining -gt 0) {
+                      $Wanted = [int][Math]::Min($Buffer.Length, $Remaining)
+                      $Read = $InputStream.Read($Buffer, 0, $Wanted)
+                      if ($Read -le 0) { break }
+                      $PartStream.Write($Buffer, 0, $Read)
+                      $Remaining -= $Read
+                    }
+                  }
+                  finally { $PartStream.Dispose() }
+
+                  if ((Get-Item $PartPath).Length -eq 0) {
+                    Remove-Item $PartPath -Force
+                    break
+                  }
+
+                  $ArchiveNames += $PartName
+                  if ($InputStream.Position -ge $InputStream.Length) { break }
+                }
+              }
+              finally { $InputStream.Dispose() }
+              Remove-Item $TemporaryArchive -Force
+            }
+            else {
+              $ArchiveNames += $ZipName
+            }
           }
 
           # ============================================
@@ -1382,14 +1397,22 @@ jobs:
             $ReleaseTitle = "Minecraft Emergency Backup (Partial)"
             $ReleaseNotes = @(
               "Emergency backup uploaded with partial copy errors."
-              "Successfully copied files and folders are included in the ZIP assets."
-              "Some source files could not be copied. See BackupReport.zip and Logs.zip for details."
+              "Successfully copied Desktop, Chrome and Edge data are included in the ZIP assets."
+              "Some source files could not be copied. See BackupReport.txt.zip and Logs.zip for details."
               "Backup error entries: $($script:BackupErrors.Count)"
             ) -join "`n"
           }
           else {
-            $ReleaseTitle = "Minecraft Full Emergency Backup"
-            $ReleaseNotes = "Backup completed without reported copy errors. See BackupReport.zip for the report."
+            $ReleaseTitle = "Minecraft Desktop + Chrome + Edge Backup"
+            $ReleaseNotes = "Desktop (including Minecraft) and Chrome/Edge browser profiles backed up. Cache folders are excluded. See BackupReport.txt.zip for the report."
+          }
+
+          $RepositoryIsPrivate = gh api "repos/$env:GITHUB_REPOSITORY" --jq .private
+          $PrivateCheckCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+
+          if ($PrivateCheckCode -ne 0 -or "$RepositoryIsPrivate".Trim() -ne "true") {
+            throw "Refusing to upload Chrome/Edge browser profile data to a public or unverifiable repository. Make the repository private, then run the backup again."
           }
 
           gh release create $Tag `
