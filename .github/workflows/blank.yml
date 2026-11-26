@@ -18,7 +18,6 @@ jobs:
 
     env:
       SERVER_DIR: C:\Users\Public\Desktop\Minecraft
-      BACKUP_DIR: ${{ runner.temp }}\MinecraftBackup
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
@@ -153,10 +152,8 @@ jobs:
 
           Set-Location $ServerDir
 
-          # Accept EULA
           Set-Content -Path "eula.txt" -Value "eula=true"
 
-          # JVM memory
           Set-Content -Path "user_jvm_args.txt" -Value @(
             "-Xms2G"
             "-Xmx12G"
@@ -167,14 +164,13 @@ jobs:
             "-XX:+DisableExplicitGC"
           )
 
-          # Generate RCON password
           $RconPassword = [Guid]::NewGuid().ToString("N")
 
           if (!(Test-Path "server.properties")) {
             New-Item -ItemType File -Path "server.properties" | Out-Null
           }
 
-          $Properties = Get-Content "server.properties"
+          $Properties = @(Get-Content "server.properties")
 
           $Settings = @{
             "enable-rcon" = "true"
@@ -184,7 +180,6 @@ jobs:
 
           foreach ($Key in $Settings.Keys) {
             $Pattern = "^" + [Regex]::Escape($Key) + "="
-
             $Found = $false
 
             for ($i = 0; $i -lt $Properties.Count; $i++) {
@@ -201,10 +196,8 @@ jobs:
 
           Set-Content -Path "server.properties" -Value $Properties
 
-          # Remove previous stop request
           Remove-Item "$ServerDir\STOP_SERVER.txt" -Force -ErrorAction SilentlyContinue
 
-          # Start BAT
           @'
           @echo off
           cd /d "%~dp0"
@@ -212,14 +205,13 @@ jobs:
           pause
           '@ | Set-Content "$ServerDir\START MINECRAFT SERVER.bat"
 
-          # Stop and backup BAT
           @'
           @echo off
           echo.
           echo Minecraft server stop and backup requested.
           echo.
           echo STOP > "%~dp0STOP_SERVER.txt"
-          echo Request sent. The GitHub workflow will stop the server and create a backup.
+          echo Request sent. The workflow will stop the server and create a backup.
           echo.
           pause
           '@ | Set-Content "$ServerDir\STOP SERVER + BACKUP.bat"
@@ -231,7 +223,6 @@ jobs:
             "C:\Users\Public\Desktop\STOP SERVER + BACKUP.bat" -Force
 
           Write-Host "Minecraft server prepared."
-          Write-Host "RCON configured."
 
       # 5. Configure RDP
       - name: Configure Remote Desktop
@@ -422,7 +413,6 @@ jobs:
           $Elapsed = 0
 
           Write-Host "Waiting for stop request."
-          Write-Host "Maximum wait: $MaximumMinutes minutes."
 
           while ($Elapsed -lt $MaximumMinutes) {
 
@@ -506,7 +496,6 @@ jobs:
 
             $PayloadBytes = [Text.Encoding]::UTF8.GetBytes($Payload)
             $Length = 4 + 4 + $PayloadBytes.Length + 2
-
             $Packet = New-Object byte[] (4 + $Length)
 
             [BitConverter]::GetBytes($Length).CopyTo($Packet, 0)
@@ -514,7 +503,6 @@ jobs:
             [BitConverter]::GetBytes($Type).CopyTo($Packet, 8)
 
             $PayloadBytes.CopyTo($Packet, 12)
-
             $Packet[12 + $PayloadBytes.Length] = 0
             $Packet[13 + $PayloadBytes.Length] = 0
 
@@ -529,7 +517,6 @@ jobs:
               $Client = New-Object System.Net.Sockets.TcpClient
               $Client.ReceiveTimeout = 5000
               $Client.SendTimeout = 5000
-
               $Client.Connect("127.0.0.1", 25575)
 
               $Stream = $Client.GetStream()
@@ -549,7 +536,6 @@ jobs:
               Send-RconPacket $Stream 2 2 "stop"
 
               Write-Host "RCON stop command sent."
-
               $Stopped = $true
               $Client.Close()
             }
@@ -562,7 +548,6 @@ jobs:
             Start-Sleep -Seconds 30
           }
 
-          # Fallback if Java is still running
           $JavaProcesses = Get-CimInstance Win32_Process |
             Where-Object {
               $_.Name -eq "java.exe" -and
@@ -575,7 +560,7 @@ jobs:
                 -ErrorAction SilentlyContinue
 
               if ($StillRunning) {
-                Write-Warning "Java is still running. Force stopping PID $($JavaProcess.ProcessId)."
+                Write-Warning "Force stopping Java PID $($JavaProcess.ProcessId)."
                 Stop-Process -Id $JavaProcess.ProcessId -Force
               }
             }
@@ -592,7 +577,7 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $ServerDir = $env:SERVER_DIR
-          $BackupDir = $env:BACKUP_DIR
+          $BackupDir = "$env:RUNNER_TEMP\MinecraftBackup"
 
           if (!(Test-Path $ServerDir)) {
             throw "Minecraft server directory not found."
@@ -664,11 +649,9 @@ jobs:
           Write-Host "Backup uploaded successfully."
           Write-Host "Release tag: $Tag"
 
-      # 14. Final information
+      # 14. Final status
       - name: Final Status
         if: always()
         shell: pwsh
         run: |
-          Write-Host "================================="
           Write-Host "Minecraft workflow finished."
-          Write-Host "================================="
