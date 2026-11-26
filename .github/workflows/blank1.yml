@@ -122,49 +122,183 @@ jobs:
           Write-Host "RDP listener enabled for Tailscale and the separate Bore relay."
 
       # ================================================
-      # 3. CONNECT THIS WINDOWS RUNNER TO TAILSCALE
+      # 3. INSTALL AND CONNECT TAILSCALE
       # ================================================
 
-      - name: Connect Windows runner to Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          hostname: danial-minecraft-rdp
-          version: latest
-          log-mode: normal
+      - name: Install and connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
 
-      - name: Publish Tailscale RDP address
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw "TAILSCALE_AUTHKEY secret is missing."
+          }
+
+          $Msi = "$env:RUNNER_TEMP\tailscale.msi"
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $Msi
+
+          $Install = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$Msi`" /qn /norestart" `
+            -Wait -PassThru
+
+          if ($Install.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed with exit code $($Install.ExitCode)."
+          }
+
+          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (!(Test-Path $Tailscale)) {
+            throw "Tailscale CLI was not found after installation."
+          }
+
+          $Service = Get-Service -Name "Tailscale" -ErrorAction Stop
+          if ($Service.Status -ne "Running") {
+            Start-Service -Name "Tailscale"
+          }
+
+          & $Tailscale up `
+            "--authkey=$env:TAILSCALE_AUTHKEY" `
+            "--hostname=minecraft-$env:GITHUB_RUN_ID" `
+            "--accept-routes"
+
+          $Code = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+          if ($Code -ne 0) {
+            throw "Tailscale connection failed with exit code $Code."
+          }
+
+          $IP = (& $Tailscale ip -4 | Select-Object -First 1).Trim()
+          $Code = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+          if ($Code -ne 0 -or [string]::IsNullOrWhiteSpace($IP)) {
+            throw "Could not retrieve Tailscale IPv4 address."
+          }
+
+          Add-Content $env:GITHUB_ENV "TAILSCALE_RDP_IP=$IP"
+          Write-Host "Tailscale connected."
+          Write-Host "TAILSCALE PRIVATE RDP: ${IP}:3389"
+
+      # ================================================
+      # 4. VERIFY RDP AND START TAILSCALE FUNNEL
+      # ================================================
+
+      - name: Start Tailscale Funnel TCP tunnel for RDP
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $Tailscale = Get-Command tailscale.exe -ErrorAction SilentlyContinue
-          if ($Tailscale) {
-            $TailscaleExe = $Tailscale.Source
-          }
-          else {
-            $Candidates = @(
-              "$env:ProgramFiles\Tailscale\tailscale.exe",
-              "$env:ProgramFiles\Tailscale IPN\tailscale.exe"
-            )
-            $TailscaleExe = $Candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          }
-          if (!$TailscaleExe) {
-            throw "Tailscale CLI was not found after the GitHub Action connected the runner."
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (!(Test-Path $Tailscale)) {
+            throw "Tailscale executable was not found."
           }
 
-          $TailscaleIP = (& $TailscaleExe ip --4 | Select-Object -First 1).Trim()
-          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($TailscaleIP)) {
-            throw "Could not obtain the runner's Tailscale IPv4 address."
+          Write-Host "Checking RDP registry and service..."
+          $RdpDenied = (Get-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections").fDenyTSConnections
+
+          if ($RdpDenied -ne 0) {
+            throw "Windows RDP is disabled in registry."
           }
 
-          Add-Content $env:GITHUB_ENV "TAILSCALE_RDP_IP=$TailscaleIP"
+          Set-Service -Name "TermService" -StartupType Automatic
+          $Service = Get-Service -Name "TermService" -ErrorAction Stop
+          if ($Service.Status -ne "Running") {
+            Start-Service -Name "TermService"
+          }
+
+          Write-Host "Checking local RDP listener on TCP 3389..."
+          $Deadline = (Get-Date).AddSeconds(90)
+          $RdpReady = $false
+
+          while ((Get-Date) -lt $Deadline) {
+            $Listener = Get-NetTCPConnection -State Listen -LocalPort 3389 -ErrorAction SilentlyContinue
+            if ($Listener) {
+              $RdpReady = $true
+              break
+            }
+            Start-Sleep -Seconds 3
+          }
+
+          if (!$RdpReady) {
+            Write-Host "TermService status:"
+            Get-Service -Name TermService | Format-List * | Out-String | Write-Host
+            Write-Host "RDP TCP listeners:"
+            Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String | Write-Host
+            Write-Host "Terminal sessions:"
+            & qwinsta.exe
+            throw "RDP port 3389 is not listening. Tailscale Funnel cannot fix a missing Windows RDP listener."
+          }
+
+          $LocalTest = Test-NetConnection 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
+          if (!$LocalTest.TcpTestSucceeded) {
+            throw "RDP listener exists but local TCP connection to 127.0.0.1:3389 failed."
+          }
+
+          Write-Host "Checking Tailscale connection..."
+          $StatusJson = & $Tailscale status --json
+          $Code = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+          if ($Code -ne 0) {
+            throw "Could not read Tailscale status."
+          }
+
+          $Status = $StatusJson | ConvertFrom-Json
+          if (!$Status.Self.Online) {
+            throw "Tailscale is not online."
+          }
+
+          $DnsName = ([string]$Status.Self.DNSName).TrimEnd(".")
+          if ([string]::IsNullOrWhiteSpace($DnsName)) {
+            throw "Could not obtain this runner's Tailscale DNS name."
+          }
+
+          $IP = (& $Tailscale ip -4 | Select-Object -First 1).Trim()
+          $Code = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+          if ($Code -ne 0 -or [string]::IsNullOrWhiteSpace($IP)) {
+            throw "Could not retrieve Tailscale IPv4 address."
+          }
+
+          Write-Host "Tailscale IPv4: $IP"
+          Write-Host "Starting Tailscale Funnel on public TCP port 10000..."
+          & $Tailscale funnel --tcp=10000 --bg --yes "tcp://127.0.0.1:3389"
+          $FunnelCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+
+          if ($FunnelCode -ne 0) {
+            throw "Tailscale Funnel failed. Check Funnel policy, MagicDNS, and HTTPS certificates in the tailnet admin console."
+          }
+
+          Start-Sleep -Seconds 5
+          Write-Host "Verifying Funnel configuration..."
+          $FunnelStatus = & $Tailscale funnel status
+          $Code = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+          $FunnelStatus | ForEach-Object { Write-Host $_ }
+          if ($Code -ne 0) {
+            throw "Could not verify Tailscale Funnel status."
+          }
+
+          $PublicAddress = "${DnsName}:10000"
+          Add-Content $env:GITHUB_ENV "RDP_PUBLIC_ADDRESS=$PublicAddress"
+
           "## Tailscale RDP" | Add-Content $env:GITHUB_STEP_SUMMARY
-          ("- Address: {0}:3389" -f $TailscaleIP) | Add-Content $env:GITHUB_STEP_SUMMARY
+          ("- Private address: {0}:3389" -f $IP) | Add-Content $env:GITHUB_STEP_SUMMARY
+          ("- Public Funnel address: {0}" -f $PublicAddress) | Add-Content $env:GITHUB_STEP_SUMMARY
           "- Username: ``NvDAdmin``" | Add-Content $env:GITHUB_STEP_SUMMARY
+
+          Write-Host ""
           Write-Host "=========================================="
-          Write-Host ("TAILSCALE RDP ADDRESS: {0}:3389" -f $TailscaleIP)
-          Write-Host "RDP USERNAME: NvDAdmin"
-          Write-Host ("Connect with Windows mstsc using {0}:3389" -f $TailscaleIP)
+          Write-Host "PUBLIC RDP ADDRESS: $PublicAddress"
+          Write-Host "TAILSCALE PRIVATE IP: $IP"
+          Write-Host "USERNAME: NvDAdmin"
+          Write-Host "PORT: 10000 (Funnel), 3389 (private Tailscale)"
           Write-Host "=========================================="
 
       # ================================================
@@ -996,7 +1130,10 @@ jobs:
           Write-Host "=============================================="
           Write-Host "RDP via Bore: bore.pub:$env:BORE_RDP_PORT"
           if (![string]::IsNullOrWhiteSpace($env:TAILSCALE_RDP_IP)) {
-            Write-Host ("RDP via Tailscale: {0}:3389" -f $env:TAILSCALE_RDP_IP)
+            Write-Host ("RDP via Tailscale (private): {0}:3389" -f $env:TAILSCALE_RDP_IP)
+          }
+          if (![string]::IsNullOrWhiteSpace($env:RDP_PUBLIC_ADDRESS)) {
+            Write-Host ("RDP via Tailscale Funnel (public): {0}" -f $env:RDP_PUBLIC_ADDRESS)
           }
           Write-Host "3X-UI local URL: https://127.0.0.1:2053$env:PANEL_BASE_PATH"
           Write-Host "3X-UI first login: admin / admin"
@@ -1005,11 +1142,12 @@ jobs:
           Write-Host "=============================================="
           Write-Host ""
           Write-Host "SECURITY SETUP REQUIRED BEFORE PUBLIC PANEL ACCESS:"
-          Write-Host ("1. For Tailscale RDP, use {0}:3389 with mstsc." -f $env:TAILSCALE_RDP_IP)
-          Write-Host "2. Alternative Bore RDP address: bore.pub:$env:BORE_RDP_PORT"
-          Write-Host "3. Open https://127.0.0.1:2053$env:PANEL_BASE_PATH inside the RDP desktop."
-          Write-Host "4. Log in with admin / admin and immediately change the panel username and password."
-          Write-Host "5. After changing credentials, run this in RDP PowerShell:"
+          Write-Host ("1. Private Tailscale RDP: {0}:3389" -f $env:TAILSCALE_RDP_IP)
+          Write-Host "2. Public Tailscale Funnel RDP: $env:RDP_PUBLIC_ADDRESS"
+          Write-Host "3. Alternative Bore RDP address: bore.pub:$env:BORE_RDP_PORT"
+          Write-Host "4. Open https://127.0.0.1:2053$env:PANEL_BASE_PATH inside the RDP desktop."
+          Write-Host "5. Log in with admin / admin and immediately change the panel username and password."
+          Write-Host "6. After changing credentials, run this in RDP PowerShell:"
           Write-Host "   New-Item -ItemType File -Path '$env:DESKTOP_DIR\ENABLE_3XUI_PUBLIC.txt' -Force"
           Write-Host "6. The workflow will publish the panel through HTTPS on a separate Bore port."
           Write-Host "Start Minecraft manually from the desktop. Cancel workflow to request emergency backup (best effort)."
