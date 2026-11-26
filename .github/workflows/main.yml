@@ -25,7 +25,7 @@ jobs:
     steps:
 
       # ================================================
-      # 1. INSTALL JAVA 17
+      # 1. JAVA 17
       # ================================================
 
       - name: Install Java 17
@@ -35,7 +35,7 @@ jobs:
           java-version: '17'
 
       # ================================================
-      # 2. CONFIGURE RDP USER
+      # 2. RDP USER
       # ================================================
 
       - name: Configure Windows RDP
@@ -54,11 +54,7 @@ jobs:
           $User = Get-LocalUser -Name "NvDAdmin" -ErrorAction SilentlyContinue
 
           if ($null -eq $User) {
-            New-LocalUser `
-              -Name "NvDAdmin" `
-              -Password $Password `
-              -PasswordNeverExpires `
-              -AccountNeverExpires
+            New-LocalUser -Name "NvDAdmin" -Password $Password -PasswordNeverExpires -AccountNeverExpires
           }
           else {
             Set-LocalUser -Name "NvDAdmin" -Password $Password
@@ -67,10 +63,7 @@ jobs:
           Enable-LocalUser -Name "NvDAdmin"
 
           foreach ($Group in @("Administrators", "Remote Desktop Users")) {
-            Add-LocalGroupMember `
-              -Group $Group `
-              -Member "NvDAdmin" `
-              -ErrorAction SilentlyContinue
+            Add-LocalGroupMember -Group $Group -Member "NvDAdmin" -ErrorAction SilentlyContinue
           }
 
           Set-ItemProperty `
@@ -92,7 +85,7 @@ jobs:
             -WindowStyle Hidden
 
           if ($ProfileProcess.ExitCode -ne 0) {
-            throw "Could not initialize NvDAdmin user profile."
+            throw "Could not initialize NvDAdmin profile."
           }
 
           New-Item -ItemType Directory -Force -Path $env:DESKTOP_DIR | Out-Null
@@ -101,7 +94,7 @@ jobs:
           Write-Host "Desktop: $env:DESKTOP_DIR"
 
       # ================================================
-      # 3. INSTALL TAILSCALE
+      # 3. TAILSCALE
       # ================================================
 
       - name: Install and connect Tailscale
@@ -128,7 +121,7 @@ jobs:
             -PassThru
 
           if ($Install.ExitCode -notin @(0, 3010)) {
-            throw "Tailscale installation failed: $($Install.ExitCode)"
+            throw "Tailscale installation failed."
           }
 
           $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
@@ -153,7 +146,7 @@ jobs:
           Write-Host "===================================="
 
       # ================================================
-      # 4. RESTORE LATEST BACKUP
+      # 4. RESTORE BACKUP
       # ================================================
 
       - name: Restore latest Minecraft backup
@@ -208,7 +201,6 @@ jobs:
             foreach ($Release in $Candidates) {
               $Tag = $Release.tagName
 
-              Write-Host ""
               Write-Host "Checking backup: $Tag"
 
               Remove-Item $DownloadDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -219,9 +211,7 @@ jobs:
                 --pattern "Minecraft-EmergencyBackup.zip" `
                 --dir $DownloadDir
 
-              $DownloadCode = $LASTEXITCODE
-
-              if ($DownloadCode -ne 0) {
+              if ($LASTEXITCODE -ne 0) {
                 Write-Warning "ZIP download failed. Trying another release."
                 continue
               }
@@ -247,9 +237,7 @@ jobs:
                   Get-Content $ShaFile -Raw
                 ).Trim() -split '\s+' | Select-Object -First 1
 
-                $ActualHash = (
-                  Get-FileHash $Zip -Algorithm SHA256
-                ).Hash
+                $ActualHash = (Get-FileHash $Zip -Algorithm SHA256).Hash
 
                 if ($ExpectedHash -ne $ActualHash) {
                   Write-Warning "SHA256 mismatch. Trying another release."
@@ -259,7 +247,7 @@ jobs:
                 Write-Host "SHA256 verification successful."
               }
               else {
-                Write-Warning "SHA256 asset is missing. Continuing without hash verification."
+                Write-Warning "SHA256 asset missing. Continuing without hash verification."
               }
 
               Remove-Item $ExtractDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -285,7 +273,6 @@ jobs:
               }
 
               Write-Host "Restore successful: $Tag"
-
               $Restored = $true
               break
             }
@@ -296,23 +283,29 @@ jobs:
           }
 
       # ================================================
-      # 5. CONFIGURE RCON AND SERVER LAUNCHER
+      # 5. GENERATE RCON PASSWORD AND CONFIGURE SERVER
       # ================================================
 
       - name: Configure Minecraft RCON
         shell: pwsh
-        env:
-          RCON_PASSWORD: ${{ secrets.RCON_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace($env:RCON_PASSWORD)) {
-            throw "RCON_PASSWORD secret is missing."
+          # Generate a new random 32-byte password.
+          $RandomBytes = New-Object byte[] 32
+          $Rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+
+          try {
+            $Rng.GetBytes($RandomBytes)
+          }
+          finally {
+            $Rng.Dispose()
           }
 
-          if ($env:RCON_PASSWORD -match '[\r\n\s]') {
-            throw "RCON_PASSWORD must not contain whitespace."
-          }
+          $RconPassword = [Convert]::ToHexString($RandomBytes)
+
+          # Make the password available to later steps.
+          Add-Content -Path $env:GITHUB_ENV -Value "RCON_PASSWORD=$RconPassword"
 
           New-Item -ItemType Directory -Force -Path $env:SERVER_DIR | Out-Null
 
@@ -328,7 +321,7 @@ jobs:
           $Settings = [ordered]@{
             "enable-rcon" = "true"
             "rcon.port" = "25575"
-            "rcon.password" = $env:RCON_PASSWORD
+            "rcon.password" = $RconPassword
             "broadcast-rcon-to-ops" = "false"
           }
 
@@ -377,7 +370,7 @@ jobs:
           Set-Content -Path $LauncherPath -Value $Launcher -Encoding ASCII
 
           Write-Host "RCON configured."
-          Write-Host "Server launcher created."
+          Write-Host "Manual server launcher created."
 
       # ================================================
       # 6. KEEP RUNNER ALIVE
@@ -397,14 +390,12 @@ jobs:
           }
 
       # ================================================
-      # 7. STOP SERVER + BACKUP + RELEASE + SHUTDOWN
+      # 7. STOP + BACKUP + RELEASE + SHUTDOWN
       # ================================================
 
       - name: Stop Minecraft and create emergency backup
         if: always()
         shell: pwsh
-        env:
-          RCON_PASSWORD: ${{ secrets.RCON_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
@@ -644,7 +635,7 @@ jobs:
           }
 
           # --------------------------------------------
-          # CALCULATE SHA256
+          # SHA256
           # --------------------------------------------
 
           Write-Host "Calculating SHA256..."
@@ -672,9 +663,7 @@ jobs:
             --title "Minecraft Emergency Backup" `
             --notes "Emergency backup of the complete NvDAdmin Desktop."
 
-          $ReleaseCode = $LASTEXITCODE
-
-          if ($ReleaseCode -ne 0) {
+          if ($LASTEXITCODE -ne 0) {
             throw "GitHub Release upload failed. Runner will not shut down."
           }
 
@@ -684,7 +673,7 @@ jobs:
           Write-Host "======================================"
 
           # --------------------------------------------
-          # SHUTDOWN WINDOWS RUNNER
+          # SHUTDOWN
           # --------------------------------------------
 
           Write-Host "Windows runner will shut down in 30 seconds."
