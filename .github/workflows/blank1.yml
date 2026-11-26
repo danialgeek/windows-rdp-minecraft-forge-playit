@@ -206,19 +206,11 @@ jobs:
               New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
               New-Item -ItemType Directory -Force -Path $ExtractDir | Out-Null
 
-              gh release download $Tag --repo $Repository --dir $DownloadDir `
-                --pattern "Desktop.zip" `
-                --pattern "Desktop.zip.part*" `
-                --pattern "Browsers-Chrome.zip" `
-                --pattern "Browsers-Chrome.zip.part*" `
-                --pattern "Browsers-Edge.zip" `
-                --pattern "Browsers-Edge.zip.part*" `
-                --pattern "Browsers-Chrome.7z" `
-                --pattern "Browsers-Chrome.7z.part*" `
-                --pattern "Browsers-Edge.7z" `
-                --pattern "Browsers-Edge.7z.part*" `
-                --pattern "AppData-Local.zip" `
-                --pattern "Minecraft-EmergencyBackup.sha256"
+              # Download all assets from the selected release. Do not use a
+              # fixed --pattern list here: older and newer backup versions use
+              # different asset names, and gh can return "no assets match the
+              # file pattern" even when the release contains valid backups.
+              gh release download $Tag --repo $Repository --dir $DownloadDir
 
               $Code = $LASTEXITCODE
               $global:LASTEXITCODE = 0
