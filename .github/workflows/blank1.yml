@@ -1,5 +1,5 @@
 
-name: Windows RDP + Minecraft Forge + 3X-UI VLESS REALITY + Bore + Desktop and Browser Backup
+name: Windows RDP + Minecraft Forge + 3X-UI VLESS REALITY + Bore + Smart Desktop and Browser Backup
 
 on:
   workflow_dispatch:
@@ -339,11 +339,10 @@ jobs:
                 continue
               }
 
-              $Files = @(Get-ChildItem $ExtractDir -Recurse -File)
-
-              if ($Files.Count -eq 0) {
-                continue
-              }
+              # A Desktop archive may legitimately contain an empty Desktop folder.
+              # Do not reject a backup only because it has zero files; validate the
+              # expected folder structure below instead. Empty browser archives are
+              # ignored and are not considered useful restore data.
 
               # Restore only the requested data: Desktop (including Minecraft)
               # and Chrome/Edge browser profiles. For compatibility with older
@@ -356,15 +355,26 @@ jobs:
                 @{ Source = "$ExtractDir\AppData\Local\Microsoft\Edge\User Data"; Destination = "$env:PROFILE_DIR\AppData\Local\Microsoft\Edge\User Data" }
               )
 
-              $HasStructuredBackup = (
-                (Test-Path "$ExtractDir\Desktop") -or
-                (Test-Path "$ExtractDir\Browsers") -or
-                (Test-Path "$ExtractDir\AppData\Local\Google\Chrome\User Data") -or
-                (Test-Path "$ExtractDir\AppData\Local\Microsoft\Edge\User Data")
-              )
+              $DesktopExists = Test-Path "$ExtractDir\Desktop"
+              $ChromeSource = "$ExtractDir\Browsers\Chrome\User Data"
+              $EdgeSource = "$ExtractDir\Browsers\Edge\User Data"
+              $OldChromeSource = "$ExtractDir\AppData\Local\Google\Chrome\User Data"
+              $OldEdgeSource = "$ExtractDir\AppData\Local\Microsoft\Edge\User Data"
 
-              if (!$HasStructuredBackup) {
-                Write-Warning "This release does not contain Desktop or Chrome/Edge browser data. Trying the next backup release."
+              function Test-HasRestorableFiles {
+                param([string]$Path)
+                if (!(Test-Path $Path)) { return $false }
+                $Found = Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+                return ($null -ne $Found)
+              }
+
+              $HasBrowserData = (Test-HasRestorableFiles $ChromeSource) -or
+                                (Test-HasRestorableFiles $EdgeSource) -or
+                                (Test-HasRestorableFiles $OldChromeSource) -or
+                                (Test-HasRestorableFiles $OldEdgeSource)
+
+              if (!$DesktopExists -and !$HasBrowserData) {
+                Write-Warning "This release contains no restorable Desktop or browser files. Trying the next backup release."
                 continue
               }
 
@@ -973,10 +983,9 @@ jobs:
           $ShaPath = "$env:RUNNER_TEMP\Minecraft-EmergencyBackup.sha256"
           $ReportPath = "$env:RUNNER_TEMP\BackupReport.txt"
 
-          if ([string]::IsNullOrWhiteSpace($env:BROWSER_BACKUP_PASSWORD)) {
-            throw "BROWSER_BACKUP_PASSWORD repository secret is missing. Add it before backing up browser profiles to a public Release."
+          if (![string]::IsNullOrWhiteSpace($env:BROWSER_BACKUP_PASSWORD)) {
+            Write-Host "::add-mask::$env:BROWSER_BACKUP_PASSWORD"
           }
-          Write-Host "::add-mask::$env:BROWSER_BACKUP_PASSWORD"
 
           Remove-Item $BackupRoot,$ZipDir,$LogDir,$ShaPath,$ReportPath -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -1175,16 +1184,20 @@ jobs:
               [string]$Source,
               [string]$Destination,
               [string]$Label,
-              [string[]]$ExcludeDirs = @()
+              [string[]]$ExcludeDirs = @(),
+              [bool]$Optional = $false
             )
 
             Write-Host ""
             Write-Host "Backing up: $Label"
 
             if (!(Test-Path $Source)) {
-              Write-Warning "Folder does not exist: $Source"
-              Add-BackupError "$Label source folder does not exist. No data was available to back up."
-              New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+              if ($Optional) {
+                Write-Host "$Label profile does not exist yet. Skipping it without creating an empty archive."
+                return
+              }
+              Write-Warning "Required folder does not exist: $Source"
+              Add-BackupError "$Label source folder does not exist."
               return
             }
 
@@ -1253,22 +1266,63 @@ jobs:
             "BrowserMetrics"
           )
 
-          $Mappings = @(
-            @{ Source = $env:DESKTOP_DIR; Destination = "$BackupRoot\Desktop"; Label = "Desktop"; ExcludeDirs = @() },
-            @{ Source = "$env:PROFILE_DIR\AppData\Local\Google\Chrome\User Data"; Destination = "$BackupRoot\Browsers\Chrome\User Data"; Label = "Chrome_Browser_Data"; ExcludeDirs = $BrowserExcludedDirs },
-            @{ Source = "$env:PROFILE_DIR\AppData\Local\Microsoft\Edge\User Data"; Destination = "$BackupRoot\Browsers\Edge\User Data"; Label = "Edge_Browser_Data"; ExcludeDirs = $BrowserExcludedDirs }
+          $DesktopMapping = @{
+            Source = $env:DESKTOP_DIR
+            Destination = "$BackupRoot\Desktop"
+            Label = "Desktop"
+            ExcludeDirs = @()
+          }
+
+          try {
+            Copy-BackupFolder $DesktopMapping.Source $DesktopMapping.Destination $DesktopMapping.Label $DesktopMapping.ExcludeDirs
+          }
+          catch {
+            Add-BackupError "Desktop: $($_.Exception.Message)"
+          }
+
+          # Browser profiles are optional. A fresh runner often has never launched
+          # Chrome or Edge, so missing or cache-only profiles are normal and must
+          # not create tiny empty 7z files or block the Desktop backup.
+          $BrowserMappings = @(
+            @{ Name = "Chrome"; Source = "$env:PROFILE_DIR\AppData\Local\Google\Chrome\User Data"; Destination = "$BackupRoot\Browsers\Chrome\User Data" },
+            @{ Name = "Edge"; Source = "$env:PROFILE_DIR\AppData\Local\Microsoft\Edge\User Data"; Destination = "$BackupRoot\Browsers\Edge\User Data" }
           )
 
-          foreach ($Mapping in $Mappings) {
+          foreach ($Browser in $BrowserMappings) {
+            if (!(Test-Path $Browser.Source)) {
+              Write-Host "$($Browser.Name) has not been initialized. Browser backup skipped."
+              continue
+            }
+
+            $ProfileFiles = @(Get-ChildItem -LiteralPath $Browser.Source -Recurse -File -ErrorAction SilentlyContinue)
+            if ($ProfileFiles.Count -eq 0) {
+              Write-Host "$($Browser.Name) profile contains no files. Browser backup skipped."
+              continue
+            }
+
+            $NonCacheFiles = @(
+              Get-ChildItem -LiteralPath $Browser.Source -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object {
+                  $Relative = $_.FullName.Substring($Browser.Source.Length).TrimStart('\')
+                  $Segments = $Relative -split '[\\/]'
+                  -not ($Segments | Where-Object { $_ -in $BrowserExcludedDirs })
+                }
+            )
+
+            if ($NonCacheFiles.Count -eq 0) {
+              Write-Host "$($Browser.Name) contains only cache files. Browser backup skipped."
+              continue
+            }
+
+            if ([string]::IsNullOrWhiteSpace($env:BROWSER_BACKUP_PASSWORD)) {
+              throw "BROWSER_BACKUP_PASSWORD secret is required because $($Browser.Name) profile data exists and must be encrypted before public upload."
+            }
+
             try {
-              Copy-BackupFolder `
-                $Mapping.Source `
-                $Mapping.Destination `
-                $Mapping.Label `
-                $Mapping.ExcludeDirs
+              Copy-BackupFolder $Browser.Source $Browser.Destination "$($Browser.Name)_Browser_Data" $BrowserExcludedDirs $true
             }
             catch {
-              Add-BackupError "$($Mapping.Label): $($_.Exception.Message)"
+              Add-BackupError "$($Browser.Name)_Browser_Data: $($_.Exception.Message)"
             }
           }
 
@@ -1284,10 +1338,10 @@ jobs:
             "Run ID: $env:GITHUB_RUN_ID"
             "Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
             "Repository: $env:GITHUB_REPOSITORY"
-            "Included: Desktop (including Minecraft), Chrome User Data, Edge User Data"
+            "Included: Desktop (including Minecraft); Chrome/Edge User Data only when profiles exist and contain non-cache files"
             "Security: Chrome/Edge archives are AES-256 encrypted before public upload."
             "Excluded: full AppData, ProgramData, Documents, Saved Games, Registry and browser cache folders"
-            "Restore requirement: BROWSER_BACKUP_PASSWORD GitHub Actions secret must match the password used for encryption."
+            "Restore requirement: BROWSER_BACKUP_PASSWORD must match the encryption password if encrypted browser archives exist."
             ""
             "Errors: $($script:BackupErrors.Count)"
             ""
@@ -1415,9 +1469,16 @@ jobs:
           foreach ($Browser in @("Chrome", "Edge")) {
             $RelativeFolder = "Browsers\$Browser"
             $SourceFolder = Join-Path $BackupRoot $RelativeFolder
-            if (!(Test-Path $SourceFolder)) {
-              Write-Warning "$Browser profile folder was not present. Skipping encrypted archive."
+            $BrowserFiles = @()
+            if (Test-Path $SourceFolder) {
+              $BrowserFiles = @(Get-ChildItem -LiteralPath $SourceFolder -Recurse -File -ErrorAction SilentlyContinue)
+            }
+            if ($BrowserFiles.Count -eq 0) {
+              Write-Host "$Browser has no copied profile data. No encrypted archive will be created."
               continue
+            }
+            if ([string]::IsNullOrWhiteSpace($env:BROWSER_BACKUP_PASSWORD)) {
+              throw "BROWSER_BACKUP_PASSWORD secret is required to encrypt the $Browser profile before public upload."
             }
 
             $ArchivePath = Join-Path $ZipDir "Browsers-$Browser.7z"
@@ -1512,7 +1573,7 @@ jobs:
           }
           else {
             $ReleaseTitle = "Minecraft Desktop + Chrome + Edge Backup"
-            $ReleaseNotes = "Desktop (including Minecraft) and Chrome/Edge browser profiles backed up. Browser profiles are AES-256 encrypted 7z assets. Cache folders are excluded. See BackupReport.txt.zip for the report."
+            $ReleaseNotes = "Desktop (including Minecraft) backed up. Chrome/Edge profiles are included only when initialized and non-empty, and are AES-256 encrypted. Cache folders are excluded. See BackupReport.txt.zip for the report."
           }
 
           gh release create $Tag `
