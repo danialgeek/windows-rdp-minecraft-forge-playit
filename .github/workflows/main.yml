@@ -34,11 +34,9 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # 3. Restore latest full Desktop backup
+      # 3. Restore latest Desktop backup
       - name: Restore Latest Desktop Backup
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -48,11 +46,19 @@ jobs:
           New-Item -ItemType Directory -Force -Path $DesktopDir | Out-Null
           New-Item -ItemType Directory -Force -Path $RestoreDir | Out-Null
 
-          $Releases = gh release list --limit 20 --json tagName,isDraft,isPrerelease |
+          Write-Host "Checking previous backups..."
+
+          $Releases = gh release list --limit 30 --json tagName,isDraft,isPrerelease |
             ConvertFrom-Json
 
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not retrieve GitHub Releases."
+          }
+
           $Latest = $Releases |
-            Where-Object { -not $_.isDraft -and -not $_.isPrerelease } |
+            Where-Object {
+              -not $_.isDraft -and -not $_.isPrerelease
+            } |
             Select-Object -First 1
 
           if (-not $Latest) {
@@ -60,11 +66,15 @@ jobs:
             exit 0
           }
 
-          Write-Host "Restoring release: $($Latest.tagName)"
+          Write-Host "Latest release: $($Latest.tagName)"
 
           gh release download $Latest.tagName `
             --pattern "Minecraft-EmergencyBackup.zip" `
             --dir $RestoreDir
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not download the previous backup."
+          }
 
           $Zip = Join-Path $RestoreDir "Minecraft-EmergencyBackup.zip"
 
@@ -72,15 +82,17 @@ jobs:
             throw "Backup ZIP was not downloaded."
           }
 
+          Write-Host "Extracting Desktop backup..."
+
           tar.exe -xf $Zip -C $DesktopDir
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Failed to extract Desktop backup."
+            throw "Desktop backup extraction failed."
           }
 
-          Write-Host "Desktop backup restored."
+          Write-Host "Desktop restored successfully."
 
-      # 4. Prepare server and find run.bat
+      # 4. Prepare Minecraft Server
       - name: Prepare Minecraft Server
         shell: pwsh
         run: |
@@ -102,7 +114,7 @@ jobs:
           )
 
           if ($RunFiles.Count -eq 0) {
-            Write-Host "Desktop file structure:"
+            Write-Host "Desktop contents:"
             Get-ChildItem $DesktopDir -Force -Recurse |
               Select-Object -First 150 FullName |
               Format-Table -AutoSize
@@ -116,10 +128,10 @@ jobs:
 
           $FoundDir = $RunFile.Directory.FullName
 
-          Write-Host "Found: $($RunFile.FullName)"
+          Write-Host "Found run.bat: $($RunFile.FullName)"
 
           if ($FoundDir.TrimEnd('\') -ne $ServerDir.TrimEnd('\')) {
-            Write-Host "Copying server files to the required directory..."
+            Write-Host "Copying server files to the main Minecraft folder..."
 
             robocopy $FoundDir $ServerDir /E /COPY:DAT /DCOPY:DAT /R:2 /W:2
 
@@ -140,7 +152,7 @@ jobs:
           "RCON_PASSWORD=$rconPassword" |
             Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
-          # Configure RCON
+          # Configure server.properties
           $properties = Join-Path $ServerDir "server.properties"
 
           if (Test-Path $properties) {
@@ -199,7 +211,7 @@ jobs:
 
           Remove-Item "$ServerDir\STOP_SERVER.txt" -Force -ErrorAction SilentlyContinue
 
-          Write-Host "Server prepared successfully."
+          Write-Host "Minecraft server prepared."
           Write-Host "Server: $ServerDir"
           Write-Host "Desktop: $DesktopDir"
 
@@ -210,6 +222,10 @@ jobs:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD secret is missing."
+          }
 
           $Password = ConvertTo-SecureString `
             $env:RDP_PASSWORD -AsPlainText -Force
@@ -249,11 +265,12 @@ jobs:
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
 
-      # 7. Show Tailscale address
+      # 7. Show RDP address
       - name: Show RDP Address
         shell: pwsh
         run: |
           $IP = tailscale ip -4
+
           Write-Host "=================================="
           Write-Host "RDP IP: $IP"
           Write-Host "Username: NvDAdmin"
@@ -262,12 +279,16 @@ jobs:
 
       # 8. Start Playit
       - name: Start Playit
-        if: ${{ secrets.PLAYIT_SECRET_KEY != '' }}
         shell: pwsh
         env:
           PLAYIT_SECRET_KEY: ${{ secrets.PLAYIT_SECRET_KEY }}
         run: |
           $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:PLAYIT_SECRET_KEY)) {
+            Write-Host "Playit secret is empty. Skipping Playit."
+            exit 0
+          }
 
           $PlayitPath = "$env:RUNNER_TEMP\playit.exe"
 
@@ -290,7 +311,6 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $ServerDir = $env:SERVER_DIR
-
           $Log = "$env:RUNNER_TEMP\minecraft-server.log"
           $ErrorLog = "$env:RUNNER_TEMP\minecraft-server-error.log"
 
@@ -306,9 +326,8 @@ jobs:
           $Process.Id |
             Out-File "$env:RUNNER_TEMP\minecraft.pid"
 
-          Write-Host "Minecraft process started. PID: $($Process.Id)"
+          Write-Host "Minecraft launcher started. PID: $($Process.Id)"
 
-          # Wait for stop marker or server process exit
           $Deadline = (Get-Date).AddMinutes(320)
 
           while ((Get-Date) -lt $Deadline) {
@@ -318,7 +337,7 @@ jobs:
             }
 
             if ($Process.HasExited) {
-              Write-Host "Minecraft process exited."
+              Write-Host "Minecraft launcher exited."
               break
             }
 
@@ -327,7 +346,7 @@ jobs:
 
           Write-Host "Minecraft waiting step finished."
 
-      # 10. Stop server safely
+      # 10. Stop Minecraft safely
       - name: Stop Minecraft Safely
         if: always()
         timeout-minutes: 3
@@ -335,17 +354,26 @@ jobs:
         run: |
           $ErrorActionPreference = "Continue"
 
-          $ServerDir = $env:SERVER_DIR
           $Password = $env:RCON_PASSWORD
 
           function Read-RconPacket($Stream) {
             $LengthBytes = New-Object byte[] 4
+            $Offset = 0
 
-            if ($Stream.Read($LengthBytes, 0, 4) -ne 4) {
-              throw "Could not read RCON packet length."
+            while ($Offset -lt 4) {
+              $Read = $Stream.Read($LengthBytes, $Offset, 4 - $Offset)
+              if ($Read -le 0) {
+                throw "Could not read RCON packet length."
+              }
+              $Offset += $Read
             }
 
             $Length = [BitConverter]::ToInt32($LengthBytes, 0)
+
+            if ($Length -lt 10 -or $Length -gt 4096) {
+              throw "Invalid RCON packet length."
+            }
+
             $Data = New-Object byte[] $Length
             $Offset = 0
 
@@ -371,12 +399,13 @@ jobs:
             $Body.Add(0)
 
             $Length = [BitConverter]::GetBytes($Body.Count)
+
             $Stream.Write($Length, 0, 4)
             $Stream.Write($Body.ToArray(), 0, $Body.Count)
           }
 
           try {
-            if (-not $Password) {
+            if ([string]::IsNullOrWhiteSpace($Password)) {
               throw "RCON password is unavailable."
             }
 
@@ -388,6 +417,7 @@ jobs:
             $Stream = $Client.GetStream()
 
             Send-RconPacket $Stream 100 3 $Password
+
             $AuthResponse = Read-RconPacket $Stream
             $AuthId = [BitConverter]::ToInt32($AuthResponse, 0)
 
@@ -396,7 +426,8 @@ jobs:
             }
 
             Send-RconPacket $Stream 101 2 "stop"
-            Write-Host "Stop command sent through RCON."
+
+            Write-Host "Minecraft stop command sent."
 
             $Stream.Close()
             $Client.Close()
@@ -405,7 +436,8 @@ jobs:
             Write-Host "RCON stop unavailable: $_"
           }
 
-          # Allow Minecraft to save its world
+          Write-Host "Waiting for Minecraft to save the world..."
+
           $Deadline = (Get-Date).AddSeconds(120)
 
           while ((Get-Date) -lt $Deadline) {
@@ -423,7 +455,6 @@ jobs:
             Start-Sleep -Seconds 5
           }
 
-          # Force stop only if still running after the save window
           $Java = Get-CimInstance Win32_Process |
             Where-Object {
               $_.Name -eq "java.exe" -and
@@ -431,16 +462,16 @@ jobs:
             }
 
           if ($Java) {
-            Write-Host "WARNING: Minecraft is still running. Stopping remaining server process."
+            Write-Host "WARNING: Server did not exit in time."
 
             foreach ($Process in $Java) {
               Stop-Process -Id $Process.ProcessId -Force -ErrorAction SilentlyContinue
             }
           }
 
-          Write-Host "Server stop stage finished."
+          Write-Host "Stop stage finished."
 
-      # 11. Backup entire Public Desktop
+      # 11. Create full Desktop backup
       - name: Create Full Desktop Backup
         if: always()
         timeout-minutes: 25
@@ -483,11 +514,12 @@ jobs:
           }
 
           $Hash = (Get-FileHash $ZipPath -Algorithm SHA256).Hash
+
           "$Hash  Minecraft-EmergencyBackup.zip" |
             Set-Content $HashPath -Encoding ascii
 
           Write-Host "Full Desktop backup created."
-          Write-Host "ZIP size: $((Get-Item $ZipPath).Length / 1MB) MB"
+          Write-Host "ZIP size: $([math]::Round((Get-Item $ZipPath).Length / 1MB, 2)) MB"
           Write-Host "SHA256: $Hash"
 
       # 12. Upload backup to GitHub Releases
@@ -495,8 +527,6 @@ jobs:
         if: always()
         timeout-minutes: 20
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -505,6 +535,10 @@ jobs:
 
           if (-not (Test-Path $ZipPath)) {
             throw "Backup ZIP does not exist. Upload skipped."
+          }
+
+          if (-not (Test-Path $HashPath)) {
+            throw "Backup SHA256 file does not exist."
           }
 
           $Tag = "minecraft-backup-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
@@ -522,7 +556,7 @@ jobs:
           Write-Host "Backup uploaded successfully."
           Write-Host "Release tag: $Tag"
 
-      # 13. Final information
+      # 13. Final status
       - name: Final Status
         if: always()
         shell: pwsh
