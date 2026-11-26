@@ -19,22 +19,19 @@ jobs:
     env:
       SERVER_DIR: C:\Users\Public\Desktop\Minecraft
       RDP_USER: NvDAdmin
-      BACKUP_NAME: Minecraft-backup.zip
 
     steps:
 
-      # 1. دریافت فایل‌های مخزن
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. نصب Java 17
       - name: Install Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # 3. بازیابی آخرین بکاپ از GitHub Releases
+      # Restore latest backup
       - name: Restore Latest Minecraft Backup
         shell: pwsh
         env:
@@ -46,8 +43,6 @@ jobs:
           $ExtractDir = "$env:RUNNER_TEMP\MinecraftRestore"
 
           New-Item -ItemType Directory -Force -Path $ServerDir | Out-Null
-
-          Write-Host "Searching for latest backup..."
 
           $Tag = gh release list `
             --repo $env:GITHUB_REPOSITORY `
@@ -66,10 +61,14 @@ jobs:
                 --pattern "Minecraft-backup.zip" `
                 --dir $env:RUNNER_TEMP
 
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Backup download failed."
+              }
+
               $Zip = "$env:RUNNER_TEMP\Minecraft-backup.zip"
 
               if (!(Test-Path $Zip)) {
-                  throw "Backup ZIP was not downloaded."
+                  throw "Backup ZIP was not found."
               }
 
               New-Item -ItemType Directory -Force -Path $ExtractDir | Out-Null
@@ -77,7 +76,6 @@ jobs:
               Expand-Archive -Path $Zip -DestinationPath $ExtractDir -Force
 
               $SourceDir = $ExtractDir
-
               $MinecraftFolder = Join-Path $ExtractDir "Minecraft"
 
               if (Test-Path $MinecraftFolder) {
@@ -86,16 +84,14 @@ jobs:
 
               robocopy $SourceDir $ServerDir /E /COPY:DAT /DCOPY:DAT /R:2 /W:2
 
-              $CopyCode = $LASTEXITCODE
-
-              if ($CopyCode -ge 8) {
-                  throw "Backup restore failed. Robocopy code: $CopyCode"
+              if ($LASTEXITCODE -ge 8) {
+                  throw "Backup restore failed."
               }
 
-              Write-Host "Minecraft backup restored."
+              Write-Host "Backup restored successfully."
           }
 
-      # 4. آماده‌سازی سرور، رم و فایل‌های کنترل
+      # Prepare server
       - name: Prepare Minecraft Server
         shell: pwsh
         run: |
@@ -105,10 +101,10 @@ jobs:
           $Desktop = "C:\Users\Public\Desktop"
 
           New-Item -ItemType Directory -Force -Path $ServerDir | Out-Null
+          New-Item -ItemType Directory -Force -Path "C:\RDP-Persistent" | Out-Null
 
-          # تنظیم حافظه Java
+          # Java RAM
           $JvmFile = Join-Path $ServerDir "user_jvm_args.txt"
-
           $JvmLines = @()
 
           if (Test-Path $JvmFile) {
@@ -124,9 +120,8 @@ jobs:
 
           Set-Content -Path $JvmFile -Value $JvmLines -Encoding ASCII
 
-          # تنظیم RCON
+          # RCON configuration
           $PropertiesFile = Join-Path $ServerDir "server.properties"
-
           $Properties = @()
 
           if (Test-Path $PropertiesFile) {
@@ -144,34 +139,23 @@ jobs:
 
           foreach ($Key in $Settings.Keys) {
               $Pattern = "^" + [regex]::Escape($Key) + "="
-
-              $Properties = @(
-                  $Properties | Where-Object { $_ -notmatch $Pattern }
-              )
-
+              $Properties = @($Properties | Where-Object { $_ -notmatch $Pattern })
               $Properties += "$Key=$($Settings[$Key])"
           }
 
           Set-Content -Path $PropertiesFile -Value $Properties -Encoding ASCII
 
-          # پاک کردن درخواست توقف قدیمی
           Remove-Item "C:\RDP-Persistent\STOP_REQUESTED" -Force -ErrorAction SilentlyContinue
 
-          New-Item -ItemType Directory -Force -Path "C:\RDP-Persistent" | Out-Null
-
-          # ساخت اسکریپت توقف امن Minecraft
+          # Stop script
           $StopScript = @'
           $ErrorActionPreference = "Stop"
 
-          $ServerDir = "C:\Users\Public\Desktop\Minecraft"
+          $PropertiesFile = "C:\Users\Public\Desktop\Minecraft\server.properties"
           $Marker = "C:\RDP-Persistent\STOP_REQUESTED"
-          $PropertiesFile = Join-Path $ServerDir "server.properties"
 
           function Read-Exact {
-              param(
-                  [System.IO.Stream]$Stream,
-                  [int]$Count
-              )
+              param([System.IO.Stream]$Stream, [int]$Count)
 
               $Buffer = New-Object byte[] $Count
               $Offset = 0
@@ -198,7 +182,6 @@ jobs:
               )
 
               $BodyBytes = [Text.Encoding]::UTF8.GetBytes($Body)
-
               $Payload = New-Object byte[] (10 + $BodyBytes.Length)
 
               [BitConverter]::GetBytes($Id).CopyTo($Payload, 0)
@@ -257,7 +240,6 @@ jobs:
               $Stream = $Client.GetStream()
 
               Send-RconPacket $Stream 100 3 $Password
-
               $Auth = Receive-RconPacket $Stream
 
               if ($Auth.Id -eq -1) {
@@ -265,52 +247,41 @@ jobs:
               }
 
               Send-RconPacket $Stream 101 2 "stop"
-
               $Response = Receive-RconPacket $Stream
-
-              Write-Host "Minecraft stop command sent."
 
               New-Item -ItemType File -Force -Path $Marker | Out-Null
 
-              Write-Host "Shutdown request created."
+              Write-Host "Minecraft stop command sent."
           }
           finally {
               $Client.Close()
           }
           '@
 
-          Set-Content `
-            -Path "$Desktop\Stop-Minecraft.ps1" `
-            -Value $StopScript `
-            -Encoding UTF8
+          Set-Content "$Desktop\Stop-Minecraft.ps1" $StopScript -Encoding UTF8
 
-          # ساخت BAT توقف سرور و درخواست بکاپ
+          # Stop BAT
           $StopBat = @'
           @echo off
-          title STOP MINECRAFT + BACKUP
-          echo.
-          echo Sending safe shutdown request...
+          title STOP SERVER + BACKUP
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Public\Desktop\Stop-Minecraft.ps1"
 
           if errorlevel 1 (
               echo.
-              echo ERROR: Minecraft did not accept the stop command.
+              echo ERROR: Could not stop Minecraft safely.
               pause
               exit /b 1
           )
 
           echo.
-          echo Shutdown request sent.
-          echo The GitHub runner will save and upload the backup.
+          echo Stop request sent.
+          echo Wait for GitHub Actions to upload the backup.
           pause
           '@
 
-          Set-Content `
-            -Path "$Desktop\STOP SERVER + BACKUP.bat" `
-            -Value $StopBat `
-            -Encoding ASCII
+          Set-Content "$Desktop\STOP SERVER + BACKUP.bat" $StopBat -Encoding ASCII
 
-          # ساخت BAT اجرای سرور
+          # Start BAT
           $StartBat = @'
           @echo off
           title Minecraft Forge Server
@@ -326,16 +297,12 @@ jobs:
           pause
           '@
 
-          Set-Content `
-            -Path "$Desktop\START MINECRAFT SERVER.bat" `
-            -Value $StartBat `
-            -Encoding ASCII
+          Set-Content "$Desktop\START MINECRAFT SERVER.bat" $StartBat -Encoding ASCII
 
           Write-Host "Server preparation completed."
-          Write-Host "Java RAM: 12GB"
-          Write-Host "RCON port: 25575"
+          Write-Host "Java maximum heap: 12GB"
 
-      # 5. فعال‌سازی RDP
+      # RDP
       - name: Configure Remote Desktop
         shell: pwsh
         env:
@@ -347,8 +314,7 @@ jobs:
               throw "RDP_PASSWORD secret is missing."
           }
 
-          $SecurePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD -AsPlainText -Force
+          $SecurePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
 
           $User = Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue
 
@@ -363,15 +329,8 @@ jobs:
                 -AccountNeverExpires
           }
 
-          Add-LocalGroupMember `
-            -Group "Administrators" `
-            -Member $env:RDP_USER `
-            -ErrorAction SilentlyContinue
-
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member $env:RDP_USER `
-            -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USER -ErrorAction SilentlyContinue
 
           Set-ItemProperty `
             -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
@@ -380,10 +339,10 @@ jobs:
 
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-          Write-Host "RDP is enabled."
+          Write-Host "RDP enabled."
           Write-Host "Username: $env:RDP_USER"
 
-      # 6. نصب و اتصال Tailscale
+      # Tailscale
       - name: Install and Connect Tailscale
         shell: pwsh
         env:
@@ -392,7 +351,7 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
-              throw "TAILSCALE_AUTHKEY secret is missing."
+              throw "TAILSCALE_AUTHKEY is missing."
           }
 
           $Msi = "$env:RUNNER_TEMP\tailscale.msi"
@@ -418,12 +377,16 @@ jobs:
             "--hostname=danialgeek-minecraft" `
             "--accept-dns=false"
 
+          if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale connection failed."
+          }
+
           Start-Sleep -Seconds 5
 
           $IP = & $Tailscale ip -4
 
           if ([string]::IsNullOrWhiteSpace($IP)) {
-              throw "Tailscale did not provide an IPv4 address."
+              throw "Tailscale IP not found."
           }
 
           Write-Host "================================"
@@ -431,91 +394,90 @@ jobs:
           Write-Host "RDP USER: $env:RDP_USER"
           Write-Host "================================"
 
-      # 7. اجرای Playit با گزارش خطا
-      - name: Start Playit
+      # Playit is optional
+      - name: Start Playit (Optional)
         shell: pwsh
+        continue-on-error: true
         env:
           PLAYIT_SECRET_KEY: ${{ secrets.PLAYIT_SECRET_KEY }}
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
 
-          if ([string]::IsNullOrWhiteSpace($env:PLAYIT_SECRET_KEY)) {
-              throw "PLAYIT_SECRET_KEY is missing."
-          }
+          $EnvFile = $env:GITHUB_ENV
 
-          $Playit = "$env:RUNNER_TEMP\playit.exe"
-          $StdOut = "$env:RUNNER_TEMP\playit.log"
-          $StdErr = "$env:RUNNER_TEMP\playit-error.log"
-
-          Invoke-WebRequest `
-            -Uri "https://github.com/playit-cloud/playit-agent/releases/download/v2.0.2/playit-windows-x86_64.exe" `
-            -OutFile $Playit
-
-          if (!(Test-Path $Playit)) {
-              throw "Playit executable download failed."
-          }
-
-          Write-Host "Starting Playit agent..."
-
-          $Process = Start-Process `
-            -FilePath $Playit `
-            -ArgumentList @($env:PLAYIT_SECRET_KEY) `
-            -WorkingDirectory $env:RUNNER_TEMP `
-            -PassThru `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput $StdOut `
-            -RedirectStandardError $StdErr
-
-          Start-Sleep -Seconds 10
-          $Process.Refresh()
-
-          if ($Process.HasExited) {
-              Write-Host "Playit exit code: $($Process.ExitCode)"
-
-              Write-Host "========== PLAYIT OUTPUT =========="
-
-              if (Test-Path $StdOut) {
-                  Get-Content $StdOut
+          try {
+              if ([string]::IsNullOrWhiteSpace($env:PLAYIT_SECRET_KEY)) {
+                  Write-Warning "Playit secret missing. Skipping."
+                  "PLAYIT_STARTED=false" | Out-File $EnvFile -Append
+                  exit 0
               }
 
-              Write-Host "========== PLAYIT ERRORS =========="
+              $Playit = "$env:RUNNER_TEMP\playit.exe"
+              $StdOut = "$env:RUNNER_TEMP\playit.log"
+              $StdErr = "$env:RUNNER_TEMP\playit-error.log"
 
-              if (Test-Path $StdErr) {
-                  Get-Content $StdErr
+              Invoke-WebRequest `
+                -Uri "https://github.com/playit-cloud/playit-agent/releases/download/v2.0.2/playit-windows-x86_64.exe" `
+                -OutFile $Playit `
+                -ErrorAction Stop
+
+              $Process = Start-Process `
+                -FilePath $Playit `
+                -ArgumentList @("--secret", $env:PLAYIT_SECRET_KEY) `
+                -WorkingDirectory $env:RUNNER_TEMP `
+                -PassThru `
+                -WindowStyle Hidden `
+                -RedirectStandardOutput $StdOut `
+                -RedirectStandardError $StdErr
+
+              Start-Sleep -Seconds 15
+              $Process.Refresh()
+
+              if ($Process.HasExited) {
+                  Write-Warning "Playit exited with code: $($Process.ExitCode)"
+
+                  if (Test-Path $StdOut) {
+                      Get-Content $StdOut
+                  }
+
+                  if (Test-Path $StdErr) {
+                      Get-Content $StdErr
+                  }
+
+                  Write-Warning "Playit failed. Continuing without Playit."
+                  "PLAYIT_STARTED=false" | Out-File $EnvFile -Append
+                  exit 0
               }
 
-              throw "Playit failed to start. Check the logs above."
+              "PLAYIT_PID=$($Process.Id)" | Out-File $EnvFile -Append
+              "PLAYIT_STARTED=true" | Out-File $EnvFile -Append
+
+              Write-Host "Playit started. PID: $($Process.Id)"
+          }
+          catch {
+              Write-Warning "Playit error: $($_.Exception.Message)"
+              Write-Warning "Skipping Playit. Workflow will continue."
+              "PLAYIT_STARTED=false" | Out-File $EnvFile -Append
+              exit 0
           }
 
-          $Process.Id | Out-File $env:GITHUB_ENV -Append
-
-          Add-Content $env:GITHUB_ENV "PLAYIT_PID=$($Process.Id)"
-
-          Write-Host "Playit is running."
-          Write-Host "PID: $($Process.Id)"
-
-      # 8. نمایش اطلاعات و انتظار برای توقف
+      # Wait for stop request
       - name: Wait for Stop Request
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
           $Marker = "C:\RDP-Persistent\STOP_REQUESTED"
-          $PlayitPid = [int]$env:PLAYIT_PID
-
           $MaxMinutes = 300
           $EndTime = (Get-Date).AddMinutes($MaxMinutes)
 
           Write-Host "================================"
-          Write-Host "Minecraft server environment is ready."
-          Write-Host "RDP username: NvDAdmin"
-          Write-Host "Minecraft port: 25565"
-          Write-Host "Playit PID: $PlayitPid"
-          Write-Host "Maximum waiting time: $MaxMinutes minutes"
+          Write-Host "RDP USER: NvDAdmin"
+          Write-Host "Playit started: $env:PLAYIT_STARTED"
           Write-Host "================================"
 
-          Write-Host "Connect using RDP, then open:"
-          Write-Host "START MINECRAFT SERVER.bat"
+          Write-Host "Connect using RDP."
+          Write-Host "Run START MINECRAFT SERVER.bat"
 
           while ((Get-Date) -lt $EndTime) {
 
@@ -524,10 +486,13 @@ jobs:
                   break
               }
 
-              $PlayitProcess = Get-Process -Id $PlayitPid -ErrorAction SilentlyContinue
+              if ($env:PLAYIT_STARTED -eq "true") {
+                  $PlayitProcess = Get-Process -Id ([int]$env:PLAYIT_PID) -ErrorAction SilentlyContinue
 
-              if (!$PlayitProcess) {
-                  throw "Playit process stopped unexpectedly."
+                  if (!$PlayitProcess) {
+                      Write-Warning "Playit stopped. Continuing without Playit."
+                      $env:PLAYIT_STARTED = "false"
+                  }
               }
 
               Start-Sleep -Seconds 15
@@ -537,7 +502,7 @@ jobs:
               Write-Host "Maximum waiting time reached."
           }
 
-      # 9. تلاش برای توقف امن Minecraft
+      # Stop Minecraft
       - name: Stop Minecraft Safely
         if: always()
         continue-on-error: true
@@ -550,20 +515,13 @@ jobs:
           if (Test-Path $StopScript) {
               Write-Host "Sending Minecraft stop command..."
 
-              & powershell.exe `
-                -NoProfile `
-                -ExecutionPolicy Bypass `
-                -File $StopScript
+              & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $StopScript
 
-              if ($LASTEXITCODE -ne 0) {
-                  Write-Warning "Could not send RCON stop command."
-              }
-
-              Write-Host "Waiting for Minecraft to save the world..."
+              Write-Host "Waiting for world saving..."
               Start-Sleep -Seconds 60
           }
 
-      # 10. تهیه بکاپ و آپلود در GitHub Releases
+      # Backup and upload
       - name: Create and Upload Minecraft Backup
         if: always()
         shell: pwsh
@@ -582,14 +540,10 @@ jobs:
               exit 0
           }
 
-          $Files = Get-ChildItem $ServerDir -Force
-
-          if ($Files.Count -eq 0) {
+          if (@(Get-ChildItem $ServerDir -Force).Count -eq 0) {
               Write-Warning "Minecraft directory is empty. Backup skipped."
               exit 0
           }
-
-          Write-Host "Preparing backup..."
 
           Remove-Item $BackupStage -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item $Zip -Force -ErrorAction SilentlyContinue
@@ -605,13 +559,9 @@ jobs:
             /XD logs crash-reports `
             /XF session.lock
 
-          $CopyCode = $LASTEXITCODE
-
-          if ($CopyCode -ge 8) {
-              throw "Backup copy failed. Robocopy code: $CopyCode"
+          if ($LASTEXITCODE -ge 8) {
+              throw "Backup copy failed. Robocopy code: $LASTEXITCODE"
           }
-
-          Write-Host "Compressing Minecraft files..."
 
           Compress-Archive `
             -Path "$BackupStage\*" `
@@ -628,17 +578,13 @@ jobs:
           Write-Host "Backup size: $([math]::Round($Size / 1GB, 2)) GB"
 
           if ($Size -ge 2GB) {
-              throw "Backup exceeds the GitHub Release 2GB asset limit."
+              throw "Backup exceeds GitHub Release asset size limit."
           }
 
           $Hash = (Get-FileHash $Zip -Algorithm SHA256).Hash
-
           Set-Content -Path $HashFile -Value "$Hash  Minecraft-backup.zip"
 
           $Tag = "backup-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-
-          Write-Host "Uploading backup to GitHub Releases..."
-          Write-Host "Release tag: $Tag"
 
           gh release create $Tag `
             $Zip `
@@ -651,14 +597,11 @@ jobs:
               throw "GitHub Release upload failed."
           }
 
-          Write-Host "================================"
           Write-Host "BACKUP UPLOAD SUCCESSFUL"
-          Write-Host "================================"
 
-      # 11. پایان
       - name: Finish
         if: always()
         shell: pwsh
         run: |
           Write-Host "Minecraft workflow finished."
-          Write-Host "Check the Actions logs and Releases for the result."
+          Write-Host "Check Actions logs and GitHub Releases."
