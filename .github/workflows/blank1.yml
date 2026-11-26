@@ -753,9 +753,48 @@ jobs:
           $ErrorActionPreference = "Stop"
           $Marker = Join-Path $env:DESKTOP_DIR "ENABLE_3XUI_PUBLIC.txt"
           $Bore = $env:BORE_EXE
-          $PanelProcess = Get-Process -Id ([int]$env:PANEL_PID) -ErrorAction Stop
-          $RdpProcess = Get-Process -Id ([int]$env:BORE_RDP_PID) -ErrorAction Stop
-          $VlessProcess = Get-Process -Id ([int]$env:BORE_VLESS_PID) -ErrorAction Stop
+          $PanelOut = Join-Path $env:RUNNER_TEMP "3x-ui-panel.log"
+          $PanelErr = Join-Path $env:RUNNER_TEMP "3x-ui-panel-error.log"
+
+          function Test-LocalTcpPort {
+            param([int]$Port)
+            $Client = [System.Net.Sockets.TcpClient]::new()
+            try {
+              $Async = $Client.BeginConnect("127.0.0.1", $Port, $null, $null)
+              if (!$Async.AsyncWaitHandle.WaitOne(2500)) { return $false }
+              $Client.EndConnect($Async)
+              return $true
+            }
+            catch { return $false }
+            finally { $Client.Dispose() }
+          }
+
+          function Assert-Service {
+            param([string]$Name, [int]$Port)
+            if (!(Test-LocalTcpPort -Port $Port)) {
+              Write-Host "--- $Name is not listening on 127.0.0.1:$Port ---"
+              if ($Name -eq "3X-UI") {
+                Get-Content $PanelOut,$PanelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+              }
+              throw "$Name is unavailable on local TCP port $Port."
+            }
+          }
+
+          function Assert-BoreProcess {
+            param([string]$Name, [string]$ProcessId)
+            $Id = 0
+            if (![int]::TryParse($ProcessId, [ref]$Id) -or $Id -le 0 -or !(Get-Process -Id $Id -ErrorAction SilentlyContinue)) {
+              throw "$Name Bore process is not running (PID: $ProcessId)."
+            }
+          }
+
+          # Do not trust PANEL_PID here. The Windows 3X-UI launcher may exit
+          # after spawning its actual service process. The listening socket is
+          # the authoritative health check for the panel.
+          Assert-Service -Name "3X-UI" -Port 2053
+          Assert-Service -Name "RDP" -Port 3389
+          Assert-BoreProcess -Name "RDP" -ProcessId $env:BORE_RDP_PID
+          Assert-BoreProcess -Name "VLESS" -ProcessId $env:BORE_VLESS_PID
 
           Write-Host "=============================================="
           Write-Host "RDP: bore.pub:$env:BORE_RDP_PORT"
@@ -767,37 +806,31 @@ jobs:
           Write-Host ""
           Write-Host "SECURITY SETUP REQUIRED BEFORE PUBLIC PANEL ACCESS:"
           Write-Host "1. Connect to RDP using the public address above."
-          Write-Host "2. Open https://127.0.0.1:2053$env:PANEL_BASE_PATH inside the RDP desktop (accept the self-signed certificate warning after checking the SHA256 in logs)."
+          Write-Host "2. Open https://127.0.0.1:2053$env:PANEL_BASE_PATH inside the RDP desktop."
           Write-Host "3. Log in with admin / admin and immediately change the panel username and password."
-          Write-Host "4. After changing credentials, run this in the RDP PowerShell:"
+          Write-Host "4. After changing credentials, run this in RDP PowerShell:"
           Write-Host "   New-Item -ItemType File -Path '$env:DESKTOP_DIR\ENABLE_3XUI_PUBLIC.txt' -Force"
-          Write-Host "5. The workflow will then publish the panel through HTTPS on a separate Bore port."
-          Write-Host ""
+          Write-Host "5. The workflow will publish the panel through HTTPS on a separate Bore port."
           Write-Host "Start Minecraft manually from the desktop. Cancel workflow to request emergency backup (best effort)."
 
           while (!(Test-Path $Marker)) {
-            foreach ($ProcessInfo in @(
-              @{ Name = "3X-UI"; Id = [int]$env:PANEL_PID },
-              @{ Name = "Bore RDP"; Id = [int]$env:BORE_RDP_PID },
-              @{ Name = "Bore VLESS"; Id = [int]$env:BORE_VLESS_PID }
-            )) {
-              if (!(Get-Process -Id $ProcessInfo.Id -ErrorAction SilentlyContinue)) {
-                throw "$($ProcessInfo.Name) process stopped before panel publication."
-              }
-            }
+            Assert-Service -Name "3X-UI" -Port 2053
+            Assert-Service -Name "RDP" -Port 3389
+              Assert-BoreProcess -Name "RDP" -ProcessId $env:BORE_RDP_PID
+            Assert-BoreProcess -Name "VLESS" -ProcessId $env:BORE_VLESS_PID
             Start-Sleep -Seconds 5
           }
 
           Write-Host "Password-change marker found. Starting public 3X-UI tunnel..."
-          $PanelOut = Join-Path $env:RUNNER_TEMP "panel-bore-out.log"
-          $PanelErr = Join-Path $env:RUNNER_TEMP "panel-bore-err.log"
-          Remove-Item $PanelOut,$PanelErr -Force -ErrorAction SilentlyContinue
+          $PanelTunnelOut = Join-Path $env:RUNNER_TEMP "panel-bore-out.log"
+          $PanelTunnelErr = Join-Path $env:RUNNER_TEMP "panel-bore-err.log"
+          Remove-Item $PanelTunnelOut,$PanelTunnelErr -Force -ErrorAction SilentlyContinue
 
           $PanelTunnel = Start-Process -FilePath $Bore `
             -ArgumentList @("local", "2053", "--local-host", "127.0.0.1", "--to", "bore.pub") `
             -PassThru `
-            -RedirectStandardOutput $PanelOut `
-            -RedirectStandardError $PanelErr
+            -RedirectStandardOutput $PanelTunnelOut `
+            -RedirectStandardError $PanelTunnelErr
 
           Add-Content $env:GITHUB_ENV "BORE_PANEL_PID=$($PanelTunnel.Id)"
 
@@ -805,10 +838,10 @@ jobs:
           $PanelPublicPort = $null
           while ((Get-Date) -lt $Deadline) {
             if ($PanelTunnel.HasExited) {
-              Get-Content $PanelOut,$PanelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+              Get-Content $PanelTunnelOut,$PanelTunnelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
               throw "Public 3X-UI Bore tunnel exited unexpectedly."
             }
-            $Combined = ((Get-Content $PanelOut,$PanelErr -ErrorAction SilentlyContinue) -join "`n")
+            $Combined = ((Get-Content $PanelTunnelOut,$PanelTunnelErr -ErrorAction SilentlyContinue) -join "`n")
             if ($Combined -match 'listening at bore\.pub:(\d+)') {
               $PanelPublicPort = [int]$Matches[1]
               break
@@ -817,7 +850,7 @@ jobs:
           }
 
           if (!$PanelPublicPort) {
-            Get-Content $PanelOut,$PanelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+            Get-Content $PanelTunnelOut,$PanelTunnelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
             throw "Public 3X-UI tunnel did not report a port."
           }
 
@@ -827,15 +860,13 @@ jobs:
           Write-Host "=============================================="
 
           while ($true) {
-            foreach ($ProcessInfo in @(
-              @{ Name = "3X-UI"; Id = [int]$env:PANEL_PID },
-              @{ Name = "Bore RDP"; Id = [int]$env:BORE_RDP_PID },
-              @{ Name = "Bore VLESS"; Id = [int]$env:BORE_VLESS_PID },
-              @{ Name = "Bore Panel"; Id = [int]$PanelTunnel.Id }
-            )) {
-              if (!(Get-Process -Id $ProcessInfo.Id -ErrorAction SilentlyContinue)) {
-                throw "$($ProcessInfo.Name) process stopped."
-              }
+            Assert-Service -Name "3X-UI" -Port 2053
+            Assert-Service -Name "RDP" -Port 3389
+              Assert-BoreProcess -Name "RDP" -ProcessId $env:BORE_RDP_PID
+            Assert-BoreProcess -Name "VLESS" -ProcessId $env:BORE_VLESS_PID
+            if ($PanelTunnel.HasExited) {
+              Get-Content $PanelTunnelOut,$PanelTunnelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+              throw "Public 3X-UI Bore tunnel process stopped."
             }
             Start-Sleep -Seconds 15
           }
