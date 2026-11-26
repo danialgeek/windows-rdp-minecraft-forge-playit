@@ -757,27 +757,45 @@ jobs:
           $PanelErr = Join-Path $env:RUNNER_TEMP "3x-ui-panel-error.log"
 
           function Test-LocalTcpPort {
-            param([int]$Port)
+            param([int]$Port, [int]$TimeoutMilliseconds = 5000)
             $Client = [System.Net.Sockets.TcpClient]::new()
             try {
-              $Async = $Client.BeginConnect("127.0.0.1", $Port, $null, $null)
-              if (!$Async.AsyncWaitHandle.WaitOne(2500)) { return $false }
-              $Client.EndConnect($Async)
-              return $true
+              $ConnectTask = $Client.ConnectAsync([System.Net.IPAddress]::Loopback, $Port)
+              if (!$ConnectTask.Wait($TimeoutMilliseconds)) { return $false }
+              return $Client.Connected
             }
             catch { return $false }
             finally { $Client.Dispose() }
           }
 
           function Assert-Service {
-            param([string]$Name, [int]$Port)
-            if (!(Test-LocalTcpPort -Port $Port)) {
-              Write-Host "--- $Name is not listening on 127.0.0.1:$Port ---"
+            param([string]$Name, [int]$Port, [int]$TimeoutSeconds = 60)
+            $Deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+            $Ready = $false
+            while ((Get-Date) -lt $Deadline) {
+              if (Test-LocalTcpPort -Port $Port -TimeoutMilliseconds 5000) {
+                $Ready = $true
+                break
+              }
+              Start-Sleep -Seconds 2
+            }
+
+            if (!$Ready) {
+              Write-Host "--- $Name is not listening on 127.0.0.1:$Port after $TimeoutSeconds seconds ---"
               if ($Name -eq "3X-UI") {
+                Write-Host "--- 3X-UI process snapshot ---"
+                Get-Process -Name "3x-ui","x-ui" -ErrorAction SilentlyContinue |
+                  Select-Object Id,ProcessName,StartTime,CPU,Responding |
+                  Format-Table -AutoSize | Out-String | Write-Host
+                Write-Host "--- TCP listeners on the expected port ---"
+                Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+                  Format-Table -AutoSize | Out-String | Write-Host
+                Write-Host "--- 3X-UI stdout/stderr ---"
                 Get-Content $PanelOut,$PanelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
               }
-              throw "$Name is unavailable on local TCP port $Port."
+              throw "$Name is unavailable on local TCP port $Port after waiting $TimeoutSeconds seconds."
             }
+            Write-Host "$Name is accepting local TCP connections on 127.0.0.1:$Port."
           }
 
           function Assert-BoreProcess {
@@ -816,7 +834,7 @@ jobs:
           while (!(Test-Path $Marker)) {
             Assert-Service -Name "3X-UI" -Port 2053
             Assert-Service -Name "RDP" -Port 3389
-              Assert-BoreProcess -Name "RDP" -ProcessId $env:BORE_RDP_PID
+            Assert-BoreProcess -Name "RDP" -ProcessId $env:BORE_RDP_PID
             Assert-BoreProcess -Name "VLESS" -ProcessId $env:BORE_VLESS_PID
             Start-Sleep -Seconds 5
           }
@@ -862,7 +880,7 @@ jobs:
           while ($true) {
             Assert-Service -Name "3X-UI" -Port 2053
             Assert-Service -Name "RDP" -Port 3389
-              Assert-BoreProcess -Name "RDP" -ProcessId $env:BORE_RDP_PID
+            Assert-BoreProcess -Name "RDP" -ProcessId $env:BORE_RDP_PID
             Assert-BoreProcess -Name "VLESS" -ProcessId $env:BORE_VLESS_PID
             if ($PanelTunnel.HasExited) {
               Get-Content $PanelTunnelOut,$PanelTunnelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
