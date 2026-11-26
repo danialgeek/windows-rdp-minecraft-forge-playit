@@ -1,0 +1,1359 @@
+
+name: Windows RDP + Minecraft Forge + 3X-UI VLESS REALITY + Bore + Full Backup
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: minecraft-server
+  cancel-in-progress: false
+
+jobs:
+  minecraft:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    env:
+      DESKTOP_DIR: 'C:\Users\NvDAdmin\Desktop'
+      PROFILE_DIR: 'C:\Users\NvDAdmin'
+      SERVER_DIR: 'C:\Users\NvDAdmin\Desktop\Minecraft'
+      BACKUP_PREFIX: minecraft-backup-
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+
+      # ================================================
+      # 1. JAVA 17
+      # ================================================
+
+      - name: Install Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Python for secure 3X-UI database configuration
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ================================================
+      # 2. CONFIGURE RDP USER
+      # ================================================
+
+      - name: Configure Windows RDP
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD secret is missing."
+          }
+
+          $Password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $User = Get-LocalUser -Name "NvDAdmin" -ErrorAction SilentlyContinue
+
+          if ($null -eq $User) {
+            New-LocalUser -Name "NvDAdmin" -Password $Password -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          }
+          else {
+            Set-LocalUser -Name "NvDAdmin" -Password $Password
+          }
+
+          Enable-LocalUser -Name "NvDAdmin"
+
+          foreach ($Group in @("Administrators", "Remote Desktop Users")) {
+            Add-LocalGroupMember -Group $Group -Member "NvDAdmin" -ErrorAction SilentlyContinue
+          }
+
+          $TsPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server"
+          $RdpPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+
+          Set-ItemProperty -Path $TsPath -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path $RdpPath -Name "UserAuthentication" -Value 1
+          Set-ItemProperty -Path $RdpPath -Name "PortNumber" -Value 3389
+
+          Set-Service -Name "TermService" -StartupType Automatic
+          Start-Service -Name "TermService"
+
+          # Keep the Windows RDP listener enabled. The GitHub-hosted VM still has no
+          # dedicated public inbound address; the public connection uses the Bore tunnel.
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue |
+            Enable-NetFirewallRule
+
+          Get-NetFirewallRule -Name "Tailscale-RDP-IPv4","Tailscale-RDP-IPv6" -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          $Credential = [PSCredential]::new(".\NvDAdmin", $Password)
+          $ProfileProcess = Start-Process `
+            -FilePath "$PSHOME\pwsh.exe" `
+            -Credential $Credential `
+            -LoadUserProfile `
+            -ArgumentList '-NoProfile -Command "exit"' `
+            -Wait -PassThru -WindowStyle Hidden
+
+          if ($ProfileProcess.ExitCode -ne 0) {
+            throw "Could not initialize NvDAdmin profile."
+          }
+
+          New-Item -ItemType Directory -Force -Path $env:DESKTOP_DIR | Out-Null
+
+          Write-Host "RDP user configured."
+          Write-Host "RDP listener enabled. Public RDP access will use the outbound Bore tunnel."
+
+      # ================================================
+      # 3. INSTALL BORE TUNNEL CLIENT
+      # ================================================
+
+      - name: Install Bore tunnel client
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          $BoreZip = Join-Path $env:RUNNER_TEMP "bore-v0.6.0-windows.zip"
+          $BoreDir = Join-Path $env:RUNNER_TEMP "bore"
+          $BoreUrl = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
+
+          Invoke-WebRequest -Uri $BoreUrl -OutFile $BoreZip
+          Expand-Archive -Path $BoreZip -DestinationPath $BoreDir -Force
+
+          $BoreExe = Get-ChildItem $BoreDir -Recurse -Filter "bore.exe" -File |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          if ([string]::IsNullOrWhiteSpace($BoreExe) -or !(Test-Path $BoreExe)) {
+            throw "Bore executable was not found after extraction."
+          }
+
+          Add-Content $env:GITHUB_ENV "BORE_EXE=$BoreExe"
+          Write-Host "Bore installed: $BoreExe"
+
+      # ================================================
+      # 4. RESTORE LATEST BACKUP
+      # ================================================
+
+      - name: Restore latest full backup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $Repository = $env:GITHUB_REPOSITORY
+          $DownloadDir = "$env:RUNNER_TEMP\BackupDownload"
+          $ExtractDir = "$env:RUNNER_TEMP\BackupExtract"
+
+          New-Item -ItemType Directory -Force -Path $env:DESKTOP_DIR | Out-Null
+          New-Item -ItemType Directory -Force -Path $env:PROFILE_DIR | Out-Null
+
+          $Releases = gh release list `
+            --repo $Repository `
+            --limit 100 `
+            --json tagName,isDraft,isPrerelease,createdAt
+
+          $Code = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+
+          if ($Code -ne 0) {
+            throw "Could not retrieve releases."
+          }
+
+          $Candidates = @(
+            $Releases |
+              ConvertFrom-Json |
+              Where-Object {
+                $_.tagName.StartsWith($env:BACKUP_PREFIX) -and
+                !$_.isDraft -and !$_.isPrerelease
+              } |
+              Sort-Object createdAt -Descending
+          )
+
+          if ($Candidates.Count -eq 0) {
+            Write-Warning "No previous backup found."
+          }
+          else {
+            $Restored = $false
+
+            foreach ($Release in $Candidates) {
+              $Tag = $Release.tagName
+
+              Write-Host "Checking backup: $Tag"
+
+              Remove-Item $DownloadDir -Recurse -Force -ErrorAction SilentlyContinue
+              Remove-Item $ExtractDir -Recurse -Force -ErrorAction SilentlyContinue
+
+              New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
+              New-Item -ItemType Directory -Force -Path $ExtractDir | Out-Null
+
+              gh release download $Tag --repo $Repository --dir $DownloadDir
+
+              $Code = $LASTEXITCODE
+              $global:LASTEXITCODE = 0
+
+              if ($Code -ne 0) {
+                continue
+              }
+
+              $ZipFiles = @(Get-ChildItem $DownloadDir -Filter "*.zip" -File)
+
+              if ($ZipFiles.Count -eq 0) {
+                continue
+              }
+
+              $ShaFile = Join-Path $DownloadDir "Minecraft-EmergencyBackup.sha256"
+
+              if (!(Test-Path $ShaFile)) {
+                Write-Warning "SHA256 manifest missing."
+                continue
+              }
+
+              $HashMap = @{}
+
+              foreach ($Line in Get-Content $ShaFile) {
+                if ($Line -match '^([A-Fa-f0-9]{64})\s+\*?(.+)$') {
+                  $HashMap[$Matches[2].Trim()] = $Matches[1].ToUpper()
+                }
+              }
+
+              $Valid = $true
+
+              foreach ($Zip in $ZipFiles) {
+                if (!$HashMap.ContainsKey($Zip.Name)) {
+                  $Valid = $false
+                  break
+                }
+
+                $Actual = (Get-FileHash $Zip.FullName -Algorithm SHA256).Hash
+
+                if ($Actual -ne $HashMap[$Zip.Name]) {
+                  $Valid = $false
+                  break
+                }
+              }
+
+              if (!$Valid) {
+                Write-Warning "Backup hash validation failed."
+                continue
+              }
+
+              foreach ($Zip in $ZipFiles) {
+                tar.exe -xf $Zip.FullName -C $ExtractDir
+
+                $Code = $LASTEXITCODE
+                $global:LASTEXITCODE = 0
+
+                if ($Code -ne 0) {
+                  $Valid = $false
+                  break
+                }
+              }
+
+              if (!$Valid) {
+                continue
+              }
+
+              $Files = @(Get-ChildItem $ExtractDir -Recurse -File)
+
+              if ($Files.Count -eq 0) {
+                continue
+              }
+
+              $Mappings = @(
+                @{ Source = "$ExtractDir\Desktop"; Destination = $env:DESKTOP_DIR },
+                @{ Source = "$ExtractDir\AppData\Roaming"; Destination = "$env:PROFILE_DIR\AppData\Roaming" },
+                @{ Source = "$ExtractDir\AppData\Local"; Destination = "$env:PROFILE_DIR\AppData\Local" },
+                @{ Source = "$ExtractDir\AppData\LocalLow"; Destination = "$env:PROFILE_DIR\AppData\LocalLow" },
+                @{ Source = "$ExtractDir\ProgramData"; Destination = "C:\ProgramData" },
+                @{ Source = "$ExtractDir\Documents"; Destination = "$env:PROFILE_DIR\Documents" },
+                @{ Source = "$ExtractDir\Saved Games"; Destination = "$env:PROFILE_DIR\Saved Games" }
+              )
+
+              $HasStructuredBackup = (
+                (Test-Path "$ExtractDir\Desktop") -or
+                (Test-Path "$ExtractDir\AppData") -or
+                (Test-Path "$ExtractDir\ProgramData")
+              )
+
+              if ($HasStructuredBackup) {
+                foreach ($Mapping in $Mappings) {
+                  if (Test-Path $Mapping.Source) {
+                    New-Item -ItemType Directory -Force -Path $Mapping.Destination | Out-Null
+
+                    robocopy $Mapping.Source $Mapping.Destination `
+                      /E /COPY:DAT /DCOPY:DAT /R:3 /W:2 /XJ
+
+                    $CopyCode = $LASTEXITCODE
+                    $global:LASTEXITCODE = 0
+
+                    if ($CopyCode -ge 8) {
+                      throw "Restore failed: $($Mapping.Source), code $CopyCode"
+                    }
+                  }
+                }
+
+                if (Test-Path "$ExtractDir\Registry") {
+                  $RegistryDestination = Join-Path $env:DESKTOP_DIR "Registry-Backup-For-Manual-Restore"
+
+                  New-Item -ItemType Directory -Force -Path $RegistryDestination | Out-Null
+
+                  robocopy "$ExtractDir\Registry" $RegistryDestination /E /R:3 /W:2
+
+                  $CopyCode = $LASTEXITCODE
+                  $global:LASTEXITCODE = 0
+
+                  if ($CopyCode -ge 8) {
+                    throw "Registry restore failed."
+                  }
+                }
+              }
+              else {
+                robocopy $ExtractDir $env:DESKTOP_DIR /E /R:3 /W:2 /XJ
+
+                $CopyCode = $LASTEXITCODE
+                $global:LASTEXITCODE = 0
+
+                if ($CopyCode -ge 8) {
+                  throw "Legacy restore failed."
+                }
+              }
+
+              Write-Host "Backup restored: $Tag"
+              $Restored = $true
+              break
+            }
+
+            if (!$Restored) {
+              throw "No valid backup could be restored."
+            }
+          }
+
+      # ================================================
+      # 5. CONFIGURE MINECRAFT RCON
+      # ================================================
+
+      - name: Configure Minecraft RCON
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $RandomBytes = New-Object byte[] 32
+          $Rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+
+          try {
+            $Rng.GetBytes($RandomBytes)
+          }
+          finally {
+            $Rng.Dispose()
+          }
+
+          $RconPassword = [Convert]::ToHexString($RandomBytes)
+
+          Add-Content -Path $env:GITHUB_ENV -Value "RCON_PASSWORD=$RconPassword"
+
+          New-Item -ItemType Directory -Force -Path $env:SERVER_DIR | Out-Null
+
+          $Properties = Join-Path $env:SERVER_DIR "server.properties"
+
+          if (Test-Path $Properties) {
+            $Lines = @(Get-Content $Properties)
+          }
+          else {
+            $Lines = @()
+          }
+
+          $Settings = [ordered]@{
+            "enable-rcon" = "true"
+            "rcon.port" = "25575"
+            "rcon.password" = $RconPassword
+            "broadcast-rcon-to-ops" = "false"
+          }
+
+          foreach ($Key in $Settings.Keys) {
+            $Found = $false
+
+            for ($i = 0; $i -lt $Lines.Count; $i++) {
+              if ($Lines[$i] -match "^$([regex]::Escape($Key))=") {
+                $Lines[$i] = "$Key=$($Settings[$Key])"
+                $Found = $true
+              }
+            }
+
+            if (!$Found) {
+              $Lines += "$Key=$($Settings[$Key])"
+            }
+          }
+
+          $Encoding = New-Object System.Text.UTF8Encoding($false)
+
+          [System.IO.File]::WriteAllLines(
+            $Properties,
+            [string[]]$Lines,
+            $Encoding
+          )
+
+          $Launcher = @'
+          @echo off
+          title Minecraft Forge Server
+          cd /d "%~dp0Minecraft"
+          if exist run.bat (
+              call run.bat
+          ) else if exist run-server.bat (
+              call run-server.bat
+          ) else (
+              echo Minecraft Forge run.bat was not found.
+              pause
+          )
+          pause
+          '@
+
+          $LauncherPath = Join-Path $env:DESKTOP_DIR "START MINECRAFT SERVER.bat"
+
+          Set-Content -Path $LauncherPath -Value $Launcher -Encoding ASCII
+
+          Write-Host "Minecraft RCON configured."
+
+      # ================================================
+      # 6. INSTALL 3X-UI + XRAY AND START BORE TUNNELS
+      # ================================================
+
+      - name: Install 3X-UI Windows, enable panel TLS, and start panel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          $Api = "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest"
+          $Headers = @{ "User-Agent" = "GitHub-Actions-3XUI-Setup" }
+          $Release = Invoke-RestMethod -Uri $Api -Headers $Headers
+
+          $PackageAsset = $Release.assets |
+            Where-Object { $_.name -eq "x-ui-windows-amd64.zip" } |
+            Select-Object -First 1
+          $HashAsset = $Release.assets |
+            Where-Object { $_.name -eq "x-ui-windows-amd64.zip.sha256" } |
+            Select-Object -First 1
+
+          if (!$PackageAsset -or !$HashAsset) {
+            throw "Latest stable 3X-UI release is missing the Windows package or its SHA256 asset."
+          }
+
+          $PackageZip = Join-Path $env:RUNNER_TEMP "x-ui-windows-amd64.zip"
+          $HashFile = Join-Path $env:RUNNER_TEMP "x-ui-windows-amd64.zip.sha256"
+          $ExtractDir = Join-Path $env:RUNNER_TEMP "3x-ui-package"
+          $PanelLog = Join-Path $env:RUNNER_TEMP "3x-ui-panel.log"
+          $PanelErr = Join-Path $env:RUNNER_TEMP "3x-ui-panel-error.log"
+
+          Invoke-WebRequest -Uri $PackageAsset.browser_download_url -Headers $Headers -OutFile $PackageZip
+          Invoke-WebRequest -Uri $HashAsset.browser_download_url -Headers $Headers -OutFile $HashFile
+
+          $HashText = Get-Content $HashFile -Raw
+          if ($HashText -notmatch '(?i)([a-f0-9]{64})') {
+            throw "Could not read the 3X-UI SHA256 checksum."
+          }
+          $ExpectedHash = $Matches[1].ToUpperInvariant()
+          $ActualHash = (Get-FileHash $PackageZip -Algorithm SHA256).Hash
+          if ($ActualHash -ne $ExpectedHash) {
+            throw "3X-UI package SHA256 validation failed."
+          }
+          Write-Host "3X-UI package SHA256 verified."
+
+          Remove-Item $ExtractDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $ExtractDir | Out-Null
+          Expand-Archive -Path $PackageZip -DestinationPath $ExtractDir -Force
+
+          $PanelExe = Get-ChildItem $ExtractDir -Recurse -Filter "3x-ui.exe" -File |
+            Select-Object -First 1 -ExpandProperty FullName
+          if ([string]::IsNullOrWhiteSpace($PanelExe) -or !(Test-Path $PanelExe)) {
+            throw "3x-ui.exe was not found in the official Windows package."
+          }
+
+          $PanelDir = Split-Path $PanelExe -Parent
+          $XrayExe = Get-ChildItem $PanelDir -Recurse -File |
+            Where-Object { $_.Name -match '^xray(-windows-amd64)?\.exe$' } |
+            Select-Object -First 1
+          if (!$XrayExe) {
+            throw "The official 3X-UI package does not contain the Windows Xray executable."
+          }
+
+          $BinDir = Split-Path $XrayExe.FullName -Parent
+          $DbDir = $PanelDir
+          $LogDir = Join-Path $PanelDir "logs"
+          New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+
+          # Create a self-signed TLS certificate for the public Bore hostname.
+          # The panel will not be published until the default admin password is changed.
+          $CertExpiry = (Get-Date).AddDays(180)
+          $Cert = New-SelfSignedCertificate `
+            -DnsName "bore.pub" `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -KeyAlgorithm RSA `
+            -KeyLength 2048 `
+            -KeyExportPolicy Exportable `
+            -NotAfter $CertExpiry
+
+          $CertObject = Get-Item "Cert:\CurrentUser\My\$($Cert.Thumbprint)"
+          $CertPemPath = Join-Path $PanelDir "panel-bore-pub-cert.pem"
+          $KeyPemPath = Join-Path $PanelDir "panel-bore-pub-key.pem"
+          $CertPem = $CertObject.ExportCertificatePem()
+          $RsaKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($CertObject)
+          try {
+            $PrivateKeyPem = $RsaKey.ExportPkcs8PrivateKeyPem()
+          }
+          finally {
+            $RsaKey.Dispose()
+          }
+
+          [System.IO.File]::WriteAllText($CertPemPath, $CertPem, [System.Text.UTF8Encoding]::new($false))
+          [System.IO.File]::WriteAllText($KeyPemPath, $PrivateKeyPem, [System.Text.UTF8Encoding]::new($false))
+          $CertFingerprint = $CertObject.GetCertHashString([System.Security.Cryptography.HashAlgorithmName]::SHA256)
+          $PublicCertArtifact = Join-Path $env:RUNNER_TEMP "3x-ui-panel-public-cert.pem"
+          Copy-Item $CertPemPath $PublicCertArtifact -Force
+
+          # Use an unguessable panel base path and keep the database next to the executable.
+          $PathBytes = New-Object byte[] 20
+          [System.Security.Cryptography.RandomNumberGenerator]::Fill($PathBytes)
+          $PanelBasePath = "/" + [Convert]::ToHexString($PathBytes).ToLowerInvariant() + "/"
+
+          $env:XUI_DB_FOLDER = $DbDir
+          $env:XUI_LOG_FOLDER = $LogDir
+          $env:XUI_BIN_FOLDER = $BinDir
+          $env:XUI_INIT_WEB_BASE_PATH = $PanelBasePath
+
+          Add-Content $env:GITHUB_ENV "PANEL_DIR=$PanelDir"
+          Add-Content $env:GITHUB_ENV "PANEL_EXE=$PanelExe"
+          Add-Content $env:GITHUB_ENV "PANEL_BASE_PATH=$PanelBasePath"
+          Add-Content $env:GITHUB_ENV "PANEL_CERT_PATH=$CertPemPath"
+          Add-Content $env:GITHUB_ENV "PANEL_CERT_SHA256=$CertFingerprint"
+
+          # First launch creates the SQLite database and initial admin account.
+          $PanelProcess = Start-Process -FilePath $PanelExe `
+            -WorkingDirectory $PanelDir `
+            -PassThru `
+            -RedirectStandardOutput $PanelLog `
+            -RedirectStandardError $PanelErr
+
+          $DbPath = Join-Path $DbDir "x-ui.db"
+          $Deadline = (Get-Date).AddMinutes(2)
+          while ((Get-Date) -lt $Deadline -and !(Test-Path $DbPath)) {
+            if ($PanelProcess.HasExited) {
+              Get-Content $PanelLog,$PanelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+              throw "3X-UI exited before creating its SQLite database."
+            }
+            Start-Sleep -Seconds 2
+          }
+          if (!(Test-Path $DbPath)) {
+            throw "3X-UI database was not created at $DbPath."
+          }
+
+          Stop-Process -Id $PanelProcess.Id -Force
+          Start-Sleep -Seconds 2
+
+          # Set TLS and loopback-only panel binding directly in SQLite.
+          $DbScript = Join-Path $env:RUNNER_TEMP "configure_3xui_db.py"
+          @'
+          import sqlite3, sys
+          db_path, cert_path, key_path, base_path = sys.argv[1:5]
+          con = sqlite3.connect(db_path)
+          try:
+              tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+              if "settings" not in tables:
+                  raise RuntimeError("3X-UI settings table was not found")
+              values = {
+                  "webCertFile": cert_path,
+                  "webKeyFile": key_path,
+                  "webBasePath": base_path,
+                  "webListen": "127.0.0.1",
+              }
+              with con:
+                  for key, value in values.items():
+                      con.execute("INSERT OR REPLACE INTO settings (`key`, `value`) VALUES (?, ?)", (key, value))
+          finally:
+              con.close()
+          print("3X-UI HTTPS, random base path, and loopback binding configured.")
+          '@ | Set-Content -Path $DbScript -Encoding UTF8
+
+          python $DbScript $DbPath $CertPemPath $KeyPemPath $PanelBasePath
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not configure 3X-UI TLS settings in SQLite."
+          }
+
+          Remove-Item $PanelLog,$PanelErr -Force -ErrorAction SilentlyContinue
+          $PanelProcess = Start-Process -FilePath $PanelExe `
+            -WorkingDirectory $PanelDir `
+            -PassThru `
+            -RedirectStandardOutput $PanelLog `
+            -RedirectStandardError $PanelErr
+          Add-Content $env:GITHUB_ENV "PANEL_PID=$($PanelProcess.Id)"
+
+          $Deadline = (Get-Date).AddMinutes(2)
+          $PanelReady = $false
+          while ((Get-Date) -lt $Deadline) {
+            if ($PanelProcess.HasExited) {
+              Get-Content $PanelLog,$PanelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+              throw "3X-UI exited before opening its HTTPS panel."
+            }
+            try {
+              $Response = Invoke-WebRequest `
+                -Uri "https://127.0.0.1:2053$PanelBasePath" `
+                -SkipCertificateCheck `
+                -TimeoutSec 5
+              if ($Response.StatusCode -ge 200 -and $Response.StatusCode -lt 500) {
+                $PanelReady = $true
+                break
+              }
+            }
+            catch {
+              Start-Sleep -Seconds 3
+            }
+          }
+
+          if (!$PanelReady) {
+            Get-Content $PanelLog,$PanelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+            throw "3X-UI did not serve HTTPS on 127.0.0.1:2053 within two minutes."
+          }
+
+          $LocalPanelUrl = "https://127.0.0.1:2053$PanelBasePath"
+          $Info = @(
+            "3X-UI local panel: $LocalPanelUrl"
+            "Initial login: admin / admin"
+            "Change the default username and password before public exposure."
+            "Public panel TLS certificate SHA256: $CertFingerprint"
+          )
+          $Info | Set-Content -Path (Join-Path $env:DESKTOP_DIR "3X-UI-ACCESS-INFO.txt") -Encoding UTF8
+
+          Write-Host "3X-UI Windows release: $($Release.tag_name)"
+          Write-Host "3X-UI HTTPS is active on loopback only."
+          Write-Host "LOCAL PANEL URL: $LocalPanelUrl"
+          Write-Host "INITIAL LOGIN: admin / admin"
+          Write-Host "CHANGE THE DEFAULT LOGIN BEFORE CREATING ENABLE_3XUI_PUBLIC.txt."
+          Write-Host "Self-signed certificate SHA256: $CertFingerprint"
+
+      - name: Start Bore RDP and VLESS REALITY tunnels
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Bore = $env:BORE_EXE
+          if (!(Test-Path $Bore)) {
+            throw "Bore executable is missing."
+          }
+
+          function Start-BoreTunnel {
+            param(
+              [string]$Name,
+              [int]$LocalPort,
+              [string[]]$ExtraArgs = @()
+            )
+
+            $OutLog = Join-Path $env:RUNNER_TEMP "$Name-bore-out.log"
+            $ErrLog = Join-Path $env:RUNNER_TEMP "$Name-bore-err.log"
+            Remove-Item $OutLog,$ErrLog -Force -ErrorAction SilentlyContinue
+
+            $BoreArgs = @("local", [string]$LocalPort, "--local-host", "127.0.0.1", "--to", "bore.pub") + $ExtraArgs
+            $Process = Start-Process -FilePath $Bore `
+              -ArgumentList $BoreArgs `
+              -PassThru `
+              -RedirectStandardOutput $OutLog `
+              -RedirectStandardError $ErrLog
+
+            $Deadline = (Get-Date).AddSeconds(60)
+            $PublicPort = $null
+
+            while ((Get-Date) -lt $Deadline) {
+              if ($Process.HasExited) {
+                Get-Content $OutLog,$ErrLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+                throw "Bore tunnel $Name exited unexpectedly."
+              }
+
+              $Combined = ((Get-Content $OutLog,$ErrLog -ErrorAction SilentlyContinue) -join "`n")
+              if ($Combined -match 'listening at bore\.pub:(\d+)') {
+                $PublicPort = [int]$Matches[1]
+                break
+              }
+              Start-Sleep -Seconds 2
+            }
+
+            if (!$PublicPort) {
+              if (!$Process.HasExited) {
+                Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+              }
+              Get-Content $OutLog,$ErrLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+              throw "Bore tunnel $Name did not report a public port."
+            }
+
+            Add-Content $env:GITHUB_ENV "$($Name.ToUpperInvariant())_PID=$($Process.Id)"
+            Add-Content $env:GITHUB_ENV "$($Name.ToUpperInvariant())_PORT=$PublicPort"
+            Write-Host "$Name PUBLIC ADDRESS: bore.pub:$PublicPort"
+            return $PublicPort
+          }
+
+          $RdpCheck = Test-NetConnection 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
+          if (!$RdpCheck.TcpTestSucceeded) {
+            throw "Local RDP TCP 3389 is not reachable. Bore cannot expose a service that is not listening."
+          }
+
+          $RdpPort = Start-BoreTunnel -Name "BORE_RDP" -LocalPort 3389
+
+          # Reserve the same remote and local port for Xray so the VLESS link
+          # does not need a port rewrite. Try several high ports if one is busy.
+          $VlessPort = $null
+          foreach ($Candidate in @(35443,36443,37443,38443,39443,40443,41443,42443)) {
+            try {
+              Write-Host "Trying Bore/Xray port $Candidate..."
+              $VlessPort = Start-BoreTunnel `
+                -Name "BORE_VLESS" `
+                -LocalPort $Candidate `
+                -ExtraArgs @("--port", [string]$Candidate)
+              if ($VlessPort -eq $Candidate) {
+                break
+              }
+              $VlessPort = $null
+            }
+            catch {
+              Write-Warning "Bore port $Candidate is unavailable: $($_.Exception.Message)"
+              $VlessPort = $null
+            }
+          }
+
+          if (!$VlessPort) {
+            throw "Could not reserve any VLESS port on bore.pub from the configured candidate list."
+          }
+
+          Add-Content $env:GITHUB_ENV "VLESS_LOCAL_PORT=$VlessPort"
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "PUBLIC RDP: bore.pub:$RdpPort"
+          Write-Host "VLESS REALITY PUBLIC ENDPOINT: bore.pub:$VlessPort"
+          Write-Host "VLESS LOCAL INBOUND PORT MUST BE: $VlessPort"
+          Write-Host "PANEL IS HTTPS + LOOPBACK ONLY UNTIL YOU CHANGE admin/admin AND CREATE ENABLE_3XUI_PUBLIC.txt."
+          Write-Host "=========================================="
+
+      - name: Upload public 3X-UI TLS certificate
+        uses: actions/upload-artifact@v4
+        with:
+          name: 3xui-panel-public-certificate-${{ github.run_id }}
+          path: ${{ runner.temp }}/3x-ui-panel-public-cert.pem
+          if-no-files-found: error
+          retention-days: 1
+
+      # ================================================
+      # 7. KEEP SERVICES ALIVE AND ENABLE PANEL TUNNEL AFTER PASSWORD CHANGE
+      # ================================================
+
+      - name: Keep services alive and enable public panel after password change
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Marker = Join-Path $env:DESKTOP_DIR "ENABLE_3XUI_PUBLIC.txt"
+          $Bore = $env:BORE_EXE
+          $PanelProcess = Get-Process -Id ([int]$env:PANEL_PID) -ErrorAction Stop
+          $RdpProcess = Get-Process -Id ([int]$env:BORE_RDP_PID) -ErrorAction Stop
+          $VlessProcess = Get-Process -Id ([int]$env:BORE_VLESS_PID) -ErrorAction Stop
+
+          Write-Host "=============================================="
+          Write-Host "RDP: bore.pub:$env:BORE_RDP_PORT"
+          Write-Host "3X-UI local URL: https://127.0.0.1:2053$env:PANEL_BASE_PATH"
+          Write-Host "3X-UI first login: admin / admin"
+          Write-Host "VLESS REALITY endpoint: bore.pub:$env:VLESS_LOCAL_PORT"
+          Write-Host "VLESS inbound local port must be $env:VLESS_LOCAL_PORT."
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "SECURITY SETUP REQUIRED BEFORE PUBLIC PANEL ACCESS:"
+          Write-Host "1. Connect to RDP using the public address above."
+          Write-Host "2. Open https://127.0.0.1:2053$env:PANEL_BASE_PATH inside the RDP desktop (accept the self-signed certificate warning after checking the SHA256 in logs)."
+          Write-Host "3. Log in with admin / admin and immediately change the panel username and password."
+          Write-Host "4. After changing credentials, run this in the RDP PowerShell:"
+          Write-Host "   New-Item -ItemType File -Path '$env:DESKTOP_DIR\ENABLE_3XUI_PUBLIC.txt' -Force"
+          Write-Host "5. The workflow will then publish the panel through HTTPS on a separate Bore port."
+          Write-Host ""
+          Write-Host "Start Minecraft manually from the desktop. Cancel workflow to request emergency backup (best effort)."
+
+          while (!(Test-Path $Marker)) {
+            foreach ($ProcessInfo in @(
+              @{ Name = "3X-UI"; Id = [int]$env:PANEL_PID },
+              @{ Name = "Bore RDP"; Id = [int]$env:BORE_RDP_PID },
+              @{ Name = "Bore VLESS"; Id = [int]$env:BORE_VLESS_PID }
+            )) {
+              if (!(Get-Process -Id $ProcessInfo.Id -ErrorAction SilentlyContinue)) {
+                throw "$($ProcessInfo.Name) process stopped before panel publication."
+              }
+            }
+            Start-Sleep -Seconds 5
+          }
+
+          Write-Host "Password-change marker found. Starting public 3X-UI tunnel..."
+          $PanelOut = Join-Path $env:RUNNER_TEMP "panel-bore-out.log"
+          $PanelErr = Join-Path $env:RUNNER_TEMP "panel-bore-err.log"
+          Remove-Item $PanelOut,$PanelErr -Force -ErrorAction SilentlyContinue
+
+          $PanelTunnel = Start-Process -FilePath $Bore `
+            -ArgumentList @("local", "2053", "--local-host", "127.0.0.1", "--to", "bore.pub") `
+            -PassThru `
+            -RedirectStandardOutput $PanelOut `
+            -RedirectStandardError $PanelErr
+
+          Add-Content $env:GITHUB_ENV "BORE_PANEL_PID=$($PanelTunnel.Id)"
+
+          $Deadline = (Get-Date).AddSeconds(60)
+          $PanelPublicPort = $null
+          while ((Get-Date) -lt $Deadline) {
+            if ($PanelTunnel.HasExited) {
+              Get-Content $PanelOut,$PanelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+              throw "Public 3X-UI Bore tunnel exited unexpectedly."
+            }
+            $Combined = ((Get-Content $PanelOut,$PanelErr -ErrorAction SilentlyContinue) -join "`n")
+            if ($Combined -match 'listening at bore\.pub:(\d+)') {
+              $PanelPublicPort = [int]$Matches[1]
+              break
+            }
+            Start-Sleep -Seconds 2
+          }
+
+          if (!$PanelPublicPort) {
+            Get-Content $PanelOut,$PanelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+            throw "Public 3X-UI tunnel did not report a port."
+          }
+
+          Write-Host "=============================================="
+          Write-Host "PUBLIC 3X-UI PANEL: https://bore.pub:$PanelPublicPort$env:PANEL_BASE_PATH"
+          Write-Host "VLESS REALITY ENDPOINT: bore.pub:$env:VLESS_LOCAL_PORT"
+          Write-Host "=============================================="
+
+          while ($true) {
+            foreach ($ProcessInfo in @(
+              @{ Name = "3X-UI"; Id = [int]$env:PANEL_PID },
+              @{ Name = "Bore RDP"; Id = [int]$env:BORE_RDP_PID },
+              @{ Name = "Bore VLESS"; Id = [int]$env:BORE_VLESS_PID },
+              @{ Name = "Bore Panel"; Id = [int]$PanelTunnel.Id }
+            )) {
+              if (!(Get-Process -Id $ProcessInfo.Id -ErrorAction SilentlyContinue)) {
+                throw "$($ProcessInfo.Name) process stopped."
+              }
+            }
+            Start-Sleep -Seconds 15
+          }
+
+      # ================================================
+      # 8. STOP SERVER + FULL BACKUP
+      # ================================================
+
+      - name: Stop Minecraft and create full emergency backup
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $BackupRoot = "$env:RUNNER_TEMP\FullEmergencyBackup"
+          $ZipDir = "$env:RUNNER_TEMP\BackupArchives"
+          $LogDir = "$env:RUNNER_TEMP\BackupLogs"
+          $ShaPath = "$env:RUNNER_TEMP\Minecraft-EmergencyBackup.sha256"
+          $ReportPath = "$env:RUNNER_TEMP\BackupReport.txt"
+
+          Remove-Item $BackupRoot,$ZipDir,$LogDir,$ShaPath,$ReportPath -Recurse -Force -ErrorAction SilentlyContinue
+
+          New-Item -ItemType Directory -Force -Path $BackupRoot,$ZipDir,$LogDir | Out-Null
+
+          $script:BackupErrors = [System.Collections.Generic.List[string]]::new()
+
+          function Add-BackupError {
+            param([string]$Message)
+
+            $script:BackupErrors.Add($Message)
+            Write-Warning $Message
+          }
+
+          # ============================================
+          # RCON FUNCTIONS
+          # ============================================
+
+          function Read-ExactBytes {
+            param(
+              [System.IO.Stream]$Stream,
+              [int]$Count
+            )
+
+            $Buffer = New-Object byte[] $Count
+            $Offset = 0
+
+            while ($Offset -lt $Count) {
+              $Read = $Stream.Read($Buffer, $Offset, $Count - $Offset)
+
+              if ($Read -le 0) {
+                throw "RCON connection closed."
+              }
+
+              $Offset += $Read
+            }
+
+            return ,$Buffer
+          }
+
+          function Send-RconPacket {
+            param(
+              [System.IO.Stream]$Stream,
+              [int]$Id,
+              [int]$Type,
+              [string]$Body
+            )
+
+            $BodyBytes = [Text.Encoding]::UTF8.GetBytes($Body)
+            $Length = 4 + 4 + $BodyBytes.Length + 2
+            $Packet = New-Object byte[] ($Length + 4)
+
+            [BitConverter]::GetBytes([int]$Length).CopyTo($Packet, 0)
+            [BitConverter]::GetBytes([int]$Id).CopyTo($Packet, 4)
+            [BitConverter]::GetBytes([int]$Type).CopyTo($Packet, 8)
+
+            $BodyBytes.CopyTo($Packet, 12)
+
+            $Packet[$Packet.Length - 2] = 0
+            $Packet[$Packet.Length - 1] = 0
+
+            $Stream.Write($Packet, 0, $Packet.Length)
+          }
+
+          function Read-RconPacket {
+            param([System.IO.Stream]$Stream)
+
+            $LengthBytes = Read-ExactBytes $Stream 4
+            $Length = [BitConverter]::ToInt32($LengthBytes, 0)
+
+            if ($Length -lt 10 -or $Length -gt 65536) {
+              throw "Invalid RCON packet."
+            }
+
+            $Data = Read-ExactBytes $Stream $Length
+
+            return [PSCustomObject]@{
+              Id = [BitConverter]::ToInt32($Data, 0)
+              Type = [BitConverter]::ToInt32($Data, 4)
+              Body = [Text.Encoding]::UTF8.GetString($Data, 8, $Length - 10)
+            }
+          }
+
+          function Test-RconPort {
+            $Client = [System.Net.Sockets.TcpClient]::new()
+
+            try {
+              $Async = $Client.BeginConnect("127.0.0.1", 25575, $null, $null)
+
+              if (!$Async.AsyncWaitHandle.WaitOne(1000)) {
+                return $false
+              }
+
+              $Client.EndConnect($Async)
+              return $true
+            }
+            catch {
+              return $false
+            }
+            finally {
+              $Client.Close()
+            }
+          }
+
+          # ============================================
+          # STOP MINECRAFT
+          # ============================================
+
+          try {
+            Write-Host "Checking Minecraft server..."
+
+            $PortOpen = Test-RconPort
+
+            if (!$PortOpen) {
+              $JavaProcesses = @(Get-Process java,javaw -ErrorAction SilentlyContinue)
+
+              if ($JavaProcesses.Count -gt 0) {
+                $Deadline = (Get-Date).AddSeconds(60)
+
+                while (!(Test-RconPort) -and (Get-Date) -lt $Deadline) {
+                  Start-Sleep -Seconds 2
+                }
+
+                $PortOpen = Test-RconPort
+              }
+            }
+
+            if ($PortOpen) {
+              Write-Host "RCON detected."
+
+              $Client = [System.Net.Sockets.TcpClient]::new()
+              $Client.ReceiveTimeout = 10000
+              $Client.SendTimeout = 10000
+              $Stream = $null
+
+              try {
+                $Client.Connect("127.0.0.1", 25575)
+                $Stream = $Client.GetStream()
+                $Stream.ReadTimeout = 10000
+                $Stream.WriteTimeout = 10000
+
+                Send-RconPacket $Stream 1 3 $env:RCON_PASSWORD
+
+                $Auth = Read-RconPacket $Stream
+
+                if ($Auth.Id -eq -1 -or $Auth.Id -ne 1) {
+                  throw "RCON authentication failed."
+                }
+
+                Send-RconPacket $Stream 2 2 "stop"
+
+                Write-Host "Stop command sent."
+              }
+              finally {
+                if ($Stream) {
+                  $Stream.Dispose()
+                }
+
+                $Client.Close()
+              }
+
+              $Deadline = (Get-Date).AddSeconds(120)
+
+              while ((Test-RconPort) -and (Get-Date) -lt $Deadline) {
+                Start-Sleep -Seconds 2
+              }
+
+              if (Test-RconPort) {
+                Add-BackupError "Minecraft did not stop within 120 seconds."
+              }
+              else {
+                Write-Host "Minecraft stopped."
+              }
+            }
+            else {
+              $JavaProcesses = @(Get-Process java,javaw -ErrorAction SilentlyContinue)
+
+              if ($JavaProcesses.Count -gt 0) {
+                Add-BackupError "Java is running but RCON is unavailable. World backup may be unsafe."
+              }
+              else {
+                Write-Host "No Minecraft Java process detected."
+              }
+            }
+          }
+          catch {
+            Add-BackupError "Minecraft stop error: $($_.Exception.Message)"
+          }
+
+          # ============================================
+          # ROBOCOPY FUNCTION
+          # ============================================
+
+          function Copy-BackupFolder {
+            param(
+              [string]$Source,
+              [string]$Destination,
+              [string]$Label
+            )
+
+            Write-Host ""
+            Write-Host "Backing up: $Label"
+
+            if (!(Test-Path $Source)) {
+              Write-Warning "Folder does not exist: $Source"
+              New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+              return
+            }
+
+            New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+
+            $SafeLabel = $Label -replace '[^a-zA-Z0-9_-]', '_'
+            $LogFile = Join-Path $LogDir "$SafeLabel.log"
+
+            & robocopy.exe $Source $Destination `
+              /E /COPY:DAT /DCOPY:DAT `
+              /ZB /R:3 /W:2 /XJ `
+              "/LOG:$LogFile"
+
+            $CopyCode = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+
+            Write-Host "$Label Robocopy code: $CopyCode"
+
+            if ($CopyCode -ge 8) {
+              Add-BackupError "$Label Robocopy failed with code $CopyCode."
+
+              Write-Host "Relevant errors from $Label :"
+
+              Get-Content $LogFile -ErrorAction SilentlyContinue |
+                Select-String -Pattern 'ERROR|Access is denied|cannot access|FAILED' |
+                Select-Object -First 100 |
+                ForEach-Object {
+                  Write-Host $_.Line
+                }
+            }
+          }
+
+          # ============================================
+          # BACKUP FOLDERS
+          # ============================================
+
+          $Mappings = @(
+            @{ Source = $env:DESKTOP_DIR; Destination = "$BackupRoot\Desktop"; Label = "Desktop" },
+            @{ Source = "$env:PROFILE_DIR\AppData\Roaming"; Destination = "$BackupRoot\AppData\Roaming"; Label = "AppData_Roaming" },
+            @{ Source = "$env:PROFILE_DIR\AppData\Local"; Destination = "$BackupRoot\AppData\Local"; Label = "AppData_Local" },
+            @{ Source = "$env:PROFILE_DIR\AppData\LocalLow"; Destination = "$BackupRoot\AppData\LocalLow"; Label = "AppData_LocalLow" },
+            @{ Source = "C:\ProgramData"; Destination = "$BackupRoot\ProgramData"; Label = "ProgramData" },
+            @{ Source = "$env:PROFILE_DIR\Documents"; Destination = "$BackupRoot\Documents"; Label = "Documents" },
+            @{ Source = "$env:PROFILE_DIR\Saved Games"; Destination = "$BackupRoot\Saved Games"; Label = "Saved_Games" }
+          )
+
+          foreach ($Mapping in $Mappings) {
+            try {
+              Copy-BackupFolder `
+                $Mapping.Source `
+                $Mapping.Destination `
+                $Mapping.Label
+            }
+            catch {
+              Add-BackupError "$($Mapping.Label): $($_.Exception.Message)"
+            }
+          }
+
+          # ============================================
+          # REGISTRY BACKUP
+          # ============================================
+
+          try {
+            Write-Host "Exporting registry..."
+
+            $RegistryDir = "$BackupRoot\Registry"
+            New-Item -ItemType Directory -Force -Path $RegistryDir | Out-Null
+
+            $Profile = Get-CimInstance Win32_UserProfile |
+              Where-Object { $_.LocalPath -eq $env:PROFILE_DIR } |
+              Select-Object -First 1
+
+            if ($null -eq $Profile) {
+              throw "Could not find NvDAdmin profile SID."
+            }
+
+            $HiveName = "HKU\$($Profile.SID)"
+            $TemporaryHive = $false
+
+            & reg.exe query $HiveName 2>$null
+
+            $Code = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+
+            if ($Code -ne 0) {
+              $NtUser = Join-Path $env:PROFILE_DIR "NTUSER.DAT"
+
+              if (!(Test-Path $NtUser)) {
+                throw "NTUSER.DAT not found."
+              }
+
+              & reg.exe load "HKU\NvDAdminBackupTemp" $NtUser
+
+              $Code = $LASTEXITCODE
+              $global:LASTEXITCODE = 0
+
+              if ($Code -ne 0) {
+                throw "Could not load user registry hive."
+              }
+
+              $HiveName = "HKU\NvDAdminBackupTemp"
+              $TemporaryHive = $true
+            }
+
+            try {
+              & reg.exe export $HiveName "$RegistryDir\NvDAdmin-User-Registry.reg" /y
+
+              $Code = $LASTEXITCODE
+              $global:LASTEXITCODE = 0
+
+              if ($Code -ne 0) {
+                throw "User registry export failed."
+              }
+            }
+            finally {
+              if ($TemporaryHive) {
+                & reg.exe unload "HKU\NvDAdminBackupTemp"
+                $global:LASTEXITCODE = 0
+              }
+            }
+
+            & reg.exe export "HKLM\SOFTWARE" "$RegistryDir\HKLM-Software.reg" /y
+
+            $Code = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+
+            if ($Code -ne 0) {
+              throw "HKLM registry export failed."
+            }
+
+            & reg.exe query "HKLM\SOFTWARE\WOW6432Node" *> $null
+
+            $Code = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+
+            if ($Code -eq 0) {
+              & reg.exe export "HKLM\SOFTWARE\WOW6432Node" "$RegistryDir\HKLM-WOW6432Node.reg" /y
+
+              $Code = $LASTEXITCODE
+              $global:LASTEXITCODE = 0
+
+              if ($Code -ne 0) {
+                throw "HKLM WOW6432Node registry export failed."
+              }
+            }
+            else {
+              Write-Warning "HKLM\SOFTWARE\WOW6432Node does not exist. Skipping this optional export."
+            }
+
+            Write-Host "Registry export completed."
+          }
+          catch {
+            Add-BackupError "Registry: $($_.Exception.Message)"
+          }
+
+          # ============================================
+          # REPORT
+          # ============================================
+
+          $Report = @(
+            "Minecraft Emergency Backup Report"
+            "Run ID: $env:GITHUB_RUN_ID"
+            "Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            "Repository: $env:GITHUB_REPOSITORY"
+            ""
+            "Errors: $($script:BackupErrors.Count)"
+            ""
+            $script:BackupErrors
+          )
+
+          $Report | Set-Content -Path $ReportPath -Encoding UTF8
+
+          # ============================================
+          # COPY LOGS
+          # ============================================
+
+          if (Test-Path $LogDir) {
+            New-Item -ItemType Directory -Force -Path "$BackupRoot\Logs" | Out-Null
+
+            Get-ChildItem $LogDir -File | ForEach-Object {
+              Copy-Item $_.FullName "$BackupRoot\Logs" -Force
+            }
+          }
+
+          # ============================================
+          # FAIL IF ANY BACKUP ERROR
+          # ============================================
+
+          if ($script:BackupErrors.Count -gt 0) {
+            Write-Host ""
+            Write-Host "BACKUP INCOMPLETE"
+            Write-Host "Errors: $($script:BackupErrors.Count)"
+            throw "Backup incomplete. Release will not be created."
+          }
+
+          # ============================================
+          # CREATE ZIP FILES
+          # ============================================
+
+          $Folders = @(
+            "Desktop",
+            "AppData\Roaming",
+            "AppData\Local",
+            "AppData\LocalLow",
+            "ProgramData",
+            "Documents",
+            "Saved Games",
+            "Registry",
+            "Logs"
+          )
+
+          $ArchiveNames = @()
+
+          foreach ($Folder in $Folders) {
+            $SafeName = $Folder.Replace("\", "-")
+            $ZipName = "$SafeName.zip"
+            $ZipPath = Join-Path $ZipDir $ZipName
+
+            Write-Host "Creating $ZipName"
+
+            tar.exe -a -c -f $ZipPath -C $BackupRoot $Folder
+
+            $Code = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+
+            if ($Code -ne 0 -or !(Test-Path $ZipPath)) {
+              throw "Archive creation failed: $ZipName"
+            }
+
+            $ArchiveNames += $ZipName
+          }
+
+          # ============================================
+          # SHA256
+          # ============================================
+
+          $Manifest = @()
+
+          foreach ($Name in $ArchiveNames) {
+            $Path = Join-Path $ZipDir $Name
+            $Hash = (Get-FileHash $Path -Algorithm SHA256).Hash
+
+            $Manifest += "$Hash  $Name"
+          }
+
+          $Manifest | Set-Content -Path $ShaPath -Encoding ASCII
+
+          # ============================================
+          # RELEASE UPLOAD
+          # ============================================
+
+          $Tag = "minecraft-backup-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+
+          $Assets = @()
+
+          foreach ($Name in $ArchiveNames) {
+            $Assets += Join-Path $ZipDir $Name
+          }
+
+          $Assets += $ShaPath
+
+          gh release create $Tag `
+            $Assets `
+            --repo $env:GITHUB_REPOSITORY `
+            --title "Minecraft Full Emergency Backup" `
+            --notes "Verified full emergency backup."
+
+          $Code = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+
+          if ($Code -ne 0) {
+            throw "GitHub Release upload failed."
+          }
+
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "FULL BACKUP UPLOADED SUCCESSFULLY"
+          Write-Host "Release: $Tag"
+          Write-Host "Archives: $($ArchiveNames.Count)"
+          Write-Host "======================================"
+
+      # ================================================
+      # 9. UPLOAD DIAGNOSTIC LOGS
+      # ================================================
+
+      - name: Upload backup diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minecraft-backup-diagnostics-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/BackupLogs/**
+            ${{ runner.temp }}/BackupReport.txt
+          if-no-files-found: warn
+          retention-days: 7
