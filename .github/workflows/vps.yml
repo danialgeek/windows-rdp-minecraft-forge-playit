@@ -1,11 +1,12 @@
 
-name: Windows RDP + Minecraft Forge + Tailscale + Full Emergency Backup
+name: Windows RDP + Minecraft Forge + Tailscale + ngrok + Full Backup
 
 on:
   workflow_dispatch:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: minecraft-server
@@ -36,7 +37,7 @@ jobs:
           java-version: '17'
 
       # ================================================
-      # 2. RDP USER
+      # 2. CONFIGURE RDP USER
       # ================================================
 
       - name: Configure Windows RDP
@@ -52,10 +53,11 @@ jobs:
           }
 
           $Password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+
           $User = Get-LocalUser -Name "NvDAdmin" -ErrorAction SilentlyContinue
 
           if ($null -eq $User) {
-            New-LocalUser -Name "NvDAdmin" -Password $Password -PasswordNeverExpires -AccountNeverExpires
+            New-LocalUser -Name "NvDAdmin" -Password $Password -PasswordNeverExpires -AccountNeverExpires | Out-Null
           }
           else {
             Set-LocalUser -Name "NvDAdmin" -Password $Password
@@ -69,8 +71,11 @@ jobs:
 
           Set-ItemProperty `
             -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" `
-            -Value 0
+            -Name "fDenyTSConnections" -Value 0
+
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" -Value 1
 
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
@@ -81,9 +86,7 @@ jobs:
             -Credential $Credential `
             -LoadUserProfile `
             -ArgumentList '-NoProfile -Command "exit"' `
-            -Wait `
-            -PassThru `
-            -WindowStyle Hidden
+            -Wait -PassThru -WindowStyle Hidden
 
           if ($ProfileProcess.ExitCode -ne 0) {
             throw "Could not initialize NvDAdmin profile."
@@ -92,7 +95,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:DESKTOP_DIR | Out-Null
 
           Write-Host "RDP user configured."
-          Write-Host "Desktop: $env:DESKTOP_DIR"
 
       # ================================================
       # 3. TAILSCALE
@@ -116,11 +118,9 @@ jobs:
             -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
             -OutFile $Msi
 
-          $Install = Start-Process `
-            -FilePath "msiexec.exe" `
+          $Install = Start-Process msiexec.exe `
             -ArgumentList "/i `"$Msi`" /qn /norestart" `
-            -Wait `
-            -PassThru
+            -Wait -PassThru
 
           if ($Install.ExitCode -notin @(0, 3010)) {
             throw "Tailscale installation failed."
@@ -135,29 +135,133 @@ jobs:
             "--hostname=minecraft-$env:GITHUB_RUN_ID" `
             "--accept-routes"
 
-          $TailscaleCode = $LASTEXITCODE
+          $Code = $LASTEXITCODE
           $global:LASTEXITCODE = 0
 
-          if ($TailscaleCode -ne 0) {
+          if ($Code -ne 0) {
             throw "Tailscale connection failed."
           }
 
           $IP = & $Tailscale ip -4
-          $IPCode = $LASTEXITCODE
+          $Code = $LASTEXITCODE
           $global:LASTEXITCODE = 0
 
-          if ($IPCode -ne 0) {
+          if ($Code -ne 0) {
             throw "Could not retrieve Tailscale IP."
           }
 
-          Write-Host ""
-          Write-Host "===================================="
-          Write-Host "RDP IP: $IP"
-          Write-Host "USERNAME: NvDAdmin"
-          Write-Host "===================================="
+          Write-Host "TAILSCALE RDP IP: $IP"
 
       # ================================================
-      # 4. RESTORE BACKUP
+      # 4. NGROK TCP RDP
+      # ================================================
+
+      - name: Install and start ngrok TCP tunnel
+        shell: pwsh
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTHTOKEN)) {
+            throw "NGROK_AUTHTOKEN secret is missing."
+          }
+
+          $NgrokDir = "$env:RUNNER_TEMP\ngrok"
+          New-Item -ItemType Directory -Force -Path $NgrokDir | Out-Null
+
+          $Zip = "$env:RUNNER_TEMP\ngrok.zip"
+
+          Invoke-WebRequest `
+            -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
+            -OutFile $Zip
+
+          Expand-Archive -Path $Zip -DestinationPath $NgrokDir -Force
+
+          $Ngrok = Join-Path $NgrokDir "ngrok.exe"
+
+          if (!(Test-Path $Ngrok)) {
+            throw "ngrok executable was not found."
+          }
+
+          $env:NGROK_AUTHTOKEN | & $Ngrok config add-authtoken stdin
+
+          # Verify RDP service is listening before starting the tunnel.
+          $Deadline = (Get-Date).AddSeconds(45)
+          $RdpReady = $false
+
+          while ((Get-Date) -lt $Deadline) {
+            $Test = Test-NetConnection 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
+            if ($Test.TcpTestSucceeded) {
+              $RdpReady = $true
+              break
+            }
+            Start-Sleep -Seconds 3
+          }
+
+          if (!$RdpReady) {
+            throw "RDP port 3389 is not listening."
+          }
+
+          $NgrokLog = "$env:RUNNER_TEMP\ngrok.log"
+          $NgrokError = "$env:RUNNER_TEMP\ngrok-error.log"
+
+          $Process = Start-Process `
+            -FilePath $Ngrok `
+            -ArgumentList @("tcp", "3389", "--log=stdout", "--log-level=info") `
+            -PassThru `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $NgrokLog `
+            -RedirectStandardError $NgrokError
+
+          Write-Host "Waiting for ngrok endpoint..."
+
+          $Endpoint = $null
+          $Deadline = (Get-Date).AddSeconds(60)
+
+          while ((Get-Date) -lt $Deadline) {
+            if ($Process.HasExited) {
+              Get-Content $NgrokLog -ErrorAction SilentlyContinue
+              Get-Content $NgrokError -ErrorAction SilentlyContinue
+              throw "ngrok exited unexpectedly."
+            }
+
+            try {
+              $Api = Invoke-RestMethod `
+                -Uri "http://127.0.0.1:4040/api/tunnels" `
+                -TimeoutSec 3
+
+              $Tunnel = $Api.tunnels |
+                Where-Object { $_.proto -eq "tcp" } |
+                Select-Object -First 1
+
+              if ($Tunnel) {
+                $Endpoint = $Tunnel.public_url
+                break
+              }
+            }
+            catch {}
+
+            Start-Sleep -Seconds 2
+          }
+
+          if (!$Endpoint) {
+            Get-Content $NgrokLog -ErrorAction SilentlyContinue
+            throw "Could not obtain ngrok TCP address."
+          }
+
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "NGROK RDP ADDRESS:"
+          Write-Host $Endpoint
+          Write-Host "USERNAME: NvDAdmin"
+          Write-Host "======================================"
+
+          Add-Content $env:GITHUB_ENV "NGROK_RDP_ADDRESS=$Endpoint"
+
+      # ================================================
+      # 5. RESTORE LATEST BACKUP
       # ================================================
 
       - name: Restore latest full backup
@@ -178,10 +282,10 @@ jobs:
             --limit 100 `
             --json tagName,isDraft,isPrerelease,createdAt
 
-          $ReleaseCode = $LASTEXITCODE
+          $Code = $LASTEXITCODE
           $global:LASTEXITCODE = 0
 
-          if ($ReleaseCode -ne 0) {
+          if ($Code -ne 0) {
             throw "Could not retrieve releases."
           }
 
@@ -189,9 +293,8 @@ jobs:
             $Releases |
               ConvertFrom-Json |
               Where-Object {
-                $_.tagName.StartsWith($env:BACKUP_PREFIX) `
-                -and -not $_.isDraft `
-                -and -not $_.isPrerelease
+                $_.tagName.StartsWith($env:BACKUP_PREFIX) -and
+                !$_.isDraft -and !$_.isPrerelease
               } |
               Sort-Object createdAt -Descending
           )
@@ -205,7 +308,7 @@ jobs:
             foreach ($Release in $Candidates) {
               $Tag = $Release.tagName
 
-              Write-Host "Checking: $Tag"
+              Write-Host "Checking backup: $Tag"
 
               Remove-Item $DownloadDir -Recurse -Force -ErrorAction SilentlyContinue
               Remove-Item $ExtractDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -215,150 +318,133 @@ jobs:
 
               gh release download $Tag --repo $Repository --dir $DownloadDir
 
-              $DownloadCode = $LASTEXITCODE
+              $Code = $LASTEXITCODE
               $global:LASTEXITCODE = 0
 
-              if ($DownloadCode -ne 0) {
-                Write-Warning "Release download failed."
+              if ($Code -ne 0) {
                 continue
               }
 
               $ZipFiles = @(Get-ChildItem $DownloadDir -Filter "*.zip" -File)
 
               if ($ZipFiles.Count -eq 0) {
-                Write-Warning "No ZIP files found."
                 continue
               }
 
               $ShaFile = Join-Path $DownloadDir "Minecraft-EmergencyBackup.sha256"
 
-              if (Test-Path $ShaFile) {
-                $HashLines = Get-Content $ShaFile
-                $HashMap = @{}
-
-                foreach ($Line in $HashLines) {
-                  if ($Line -match '^([A-Fa-f0-9]{64})\s+\*?(.+)$') {
-                    $HashMap[$Matches[2].Trim()] = $Matches[1].ToUpper()
-                  }
-                }
-
-                $HashValid = $true
-
-                foreach ($Zip in $ZipFiles) {
-                  if (!$HashMap.ContainsKey($Zip.Name)) {
-                    Write-Warning "Missing hash for $($Zip.Name)"
-                    $HashValid = $false
-                    break
-                  }
-
-                  $Actual = (Get-FileHash $Zip.FullName -Algorithm SHA256).Hash
-
-                  if ($Actual -ne $HashMap[$Zip.Name]) {
-                    Write-Warning "Hash mismatch: $($Zip.Name)"
-                    $HashValid = $false
-                    break
-                  }
-                }
-
-                if (!$HashValid) {
-                  continue
-                }
-
-                Write-Host "All SHA256 checks passed."
+              if (!(Test-Path $ShaFile)) {
+                Write-Warning "SHA256 manifest missing."
+                continue
               }
-              else {
-                Write-Warning "SHA256 manifest missing. Checking legacy backup."
 
-                if ($ZipFiles.Count -ne 1 -or $ZipFiles[0].Name -ne "Minecraft-EmergencyBackup.zip") {
-                  continue
+              $HashMap = @{}
+
+              foreach ($Line in Get-Content $ShaFile) {
+                if ($Line -match '^([A-Fa-f0-9]{64})\s+\*?(.+)$') {
+                  $HashMap[$Matches[2].Trim()] = $Matches[1].ToUpper()
                 }
               }
 
-              $ExtractOK = $true
+              $Valid = $true
 
               foreach ($Zip in $ZipFiles) {
-                Write-Host "Extracting $($Zip.Name)"
+                if (!$HashMap.ContainsKey($Zip.Name)) {
+                  $Valid = $false
+                  break
+                }
 
-                tar.exe -xf $Zip.FullName -C $ExtractDir
+                $Actual = (Get-FileHash $Zip.FullName -Algorithm SHA256).Hash
 
-                $TarCode = $LASTEXITCODE
-                $global:LASTEXITCODE = 0
-
-                if ($TarCode -ne 0) {
-                  $ExtractOK = $false
+                if ($Actual -ne $HashMap[$Zip.Name]) {
+                  $Valid = $false
                   break
                 }
               }
 
-              if (!$ExtractOK) {
-                Write-Warning "Extraction failed."
+              if (!$Valid) {
+                Write-Warning "Backup hash validation failed."
+                continue
+              }
+
+              foreach ($Zip in $ZipFiles) {
+                tar.exe -xf $Zip.FullName -C $ExtractDir
+
+                $Code = $LASTEXITCODE
+                $global:LASTEXITCODE = 0
+
+                if ($Code -ne 0) {
+                  $Valid = $false
+                  break
+                }
+              }
+
+              if (!$Valid) {
                 continue
               }
 
               $Files = @(Get-ChildItem $ExtractDir -Recurse -File)
 
               if ($Files.Count -eq 0) {
-                Write-Warning "Backup is empty."
                 continue
               }
 
-              if ((Test-Path (Join-Path $ExtractDir "Desktop")) -or
-                  (Test-Path (Join-Path $ExtractDir "AppData")) -or
-                  (Test-Path (Join-Path $ExtractDir "ProgramData"))) {
+              $Mappings = @(
+                @{ Source = "$ExtractDir\Desktop"; Destination = $env:DESKTOP_DIR },
+                @{ Source = "$ExtractDir\AppData\Roaming"; Destination = "$env:PROFILE_DIR\AppData\Roaming" },
+                @{ Source = "$ExtractDir\AppData\Local"; Destination = "$env:PROFILE_DIR\AppData\Local" },
+                @{ Source = "$ExtractDir\AppData\LocalLow"; Destination = "$env:PROFILE_DIR\AppData\LocalLow" },
+                @{ Source = "$ExtractDir\ProgramData"; Destination = "C:\ProgramData" },
+                @{ Source = "$ExtractDir\Documents"; Destination = "$env:PROFILE_DIR\Documents" },
+                @{ Source = "$ExtractDir\Saved Games"; Destination = "$env:PROFILE_DIR\Saved Games" }
+              )
 
-                $Mappings = @(
-                  @{ Source = "$ExtractDir\Desktop"; Destination = $env:DESKTOP_DIR },
-                  @{ Source = "$ExtractDir\AppData\Roaming"; Destination = "$env:PROFILE_DIR\AppData\Roaming" },
-                  @{ Source = "$ExtractDir\AppData\Local"; Destination = "$env:PROFILE_DIR\AppData\Local" },
-                  @{ Source = "$ExtractDir\AppData\LocalLow"; Destination = "$env:PROFILE_DIR\AppData\LocalLow" },
-                  @{ Source = "$ExtractDir\ProgramData"; Destination = "C:\ProgramData" },
-                  @{ Source = "$ExtractDir\Documents"; Destination = "$env:PROFILE_DIR\Documents" },
-                  @{ Source = "$ExtractDir\Saved Games"; Destination = "$env:PROFILE_DIR\Saved Games" }
-                )
+              $HasStructuredBackup = (
+                (Test-Path "$ExtractDir\Desktop") -or
+                (Test-Path "$ExtractDir\AppData") -or
+                (Test-Path "$ExtractDir\ProgramData")
+              )
 
+              if ($HasStructuredBackup) {
                 foreach ($Mapping in $Mappings) {
                   if (Test-Path $Mapping.Source) {
                     New-Item -ItemType Directory -Force -Path $Mapping.Destination | Out-Null
 
                     robocopy $Mapping.Source $Mapping.Destination `
-                      /E /COPY:DAT /DCOPY:DAT /R:5 /W:3 /XJ /SL
+                      /E /COPY:DAT /DCOPY:DAT /R:3 /W:2 /XJ
 
                     $CopyCode = $LASTEXITCODE
                     $global:LASTEXITCODE = 0
 
                     if ($CopyCode -ge 8) {
-                      throw "Restore failed: $($Mapping.Source). Code: $CopyCode"
+                      throw "Restore failed: $($Mapping.Source), code $CopyCode"
                     }
                   }
                 }
 
-                $RegistrySource = Join-Path $ExtractDir "Registry"
-
-                if (Test-Path $RegistrySource) {
+                if (Test-Path "$ExtractDir\Registry") {
                   $RegistryDestination = Join-Path $env:DESKTOP_DIR "Registry-Backup-For-Manual-Restore"
 
                   New-Item -ItemType Directory -Force -Path $RegistryDestination | Out-Null
 
-                  robocopy $RegistrySource $RegistryDestination `
-                    /E /COPY:DAT /DCOPY:DAT /R:5 /W:3
+                  robocopy "$ExtractDir\Registry" $RegistryDestination /E /R:3 /W:2
 
                   $CopyCode = $LASTEXITCODE
                   $global:LASTEXITCODE = 0
 
                   if ($CopyCode -ge 8) {
-                    throw "Registry backup restore failed."
+                    throw "Registry restore failed."
                   }
                 }
               }
               else {
-                robocopy $ExtractDir $env:DESKTOP_DIR `
-                  /E /COPY:DAT /DCOPY:DAT /R:5 /W:3 /XJ /SL
+                robocopy $ExtractDir $env:DESKTOP_DIR /E /R:3 /W:2 /XJ
 
                 $CopyCode = $LASTEXITCODE
                 $global:LASTEXITCODE = 0
 
                 if ($CopyCode -ge 8) {
-                  throw "Legacy desktop restore failed."
+                  throw "Legacy restore failed."
                 }
               }
 
@@ -372,10 +458,8 @@ jobs:
             }
           }
 
-          $global:LASTEXITCODE = 0
-
       # ================================================
-      # 5. CONFIGURE RCON
+      # 6. CONFIGURE MINECRAFT RCON
       # ================================================
 
       - name: Configure Minecraft RCON
@@ -443,7 +527,6 @@ jobs:
           @echo off
           title Minecraft Forge Server
           cd /d "%~dp0Minecraft"
-
           if exist run.bat (
               call run.bat
           ) else if exist run-server.bat (
@@ -452,7 +535,6 @@ jobs:
               echo Minecraft Forge run.bat was not found.
               pause
           )
-
           pause
           '@
 
@@ -460,20 +542,20 @@ jobs:
 
           Set-Content -Path $LauncherPath -Value $Launcher -Encoding ASCII
 
-          Write-Host "RCON configured."
-          Write-Host "Manual launcher created."
+          Write-Host "Minecraft RCON configured."
 
       # ================================================
-      # 6. KEEP RUNNER ALIVE
+      # 7. KEEP RDP ALIVE
       # ================================================
 
       - name: Keep RDP runner alive
         shell: pwsh
         run: |
           Write-Host "======================================"
-          Write-Host "RDP is ready."
+          Write-Host "RDP IS READY"
+          Write-Host "Tailscale and ngrok are connected."
           Write-Host "Start Minecraft manually from desktop."
-          Write-Host "Press Cancel workflow to stop and backup."
+          Write-Host "Press Cancel workflow to request backup."
           Write-Host "======================================"
 
           while ($true) {
@@ -481,7 +563,7 @@ jobs:
           }
 
       # ================================================
-      # 7. STOP + FULL BACKUP + RELEASE + SHUTDOWN
+      # 8. STOP SERVER + FULL BACKUP
       # ================================================
 
       - name: Stop Minecraft and create full emergency backup
@@ -491,8 +573,27 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
 
+          $BackupRoot = "$env:RUNNER_TEMP\FullEmergencyBackup"
+          $ZipDir = "$env:RUNNER_TEMP\BackupArchives"
+          $LogDir = "$env:RUNNER_TEMP\BackupLogs"
+          $ShaPath = "$env:RUNNER_TEMP\Minecraft-EmergencyBackup.sha256"
+          $ReportPath = "$env:RUNNER_TEMP\BackupReport.txt"
+
+          Remove-Item $BackupRoot,$ZipDir,$LogDir,$ShaPath,$ReportPath -Recurse -Force -ErrorAction SilentlyContinue
+
+          New-Item -ItemType Directory -Force -Path $BackupRoot,$ZipDir,$LogDir | Out-Null
+
+          $script:BackupErrors = [System.Collections.Generic.List[string]]::new()
+
+          function Add-BackupError {
+            param([string]$Message)
+
+            $script:BackupErrors.Add($Message)
+            Write-Warning $Message
+          }
+
           # ============================================
-          # RCON FUNCTIONS
+          # RCON
           # ============================================
 
           function Read-ExactBytes {
@@ -508,7 +609,7 @@ jobs:
               $Read = $Stream.Read($Buffer, $Offset, $Count - $Offset)
 
               if ($Read -le 0) {
-                throw "RCON connection closed unexpectedly."
+                throw "RCON connection closed."
               }
 
               $Offset += $Read
@@ -548,24 +649,15 @@ jobs:
             $Length = [BitConverter]::ToInt32($LengthBytes, 0)
 
             if ($Length -lt 10 -or $Length -gt 65536) {
-              throw "Invalid RCON packet length."
+              throw "Invalid RCON packet."
             }
 
             $Data = Read-ExactBytes $Stream $Length
 
-            $Id = [BitConverter]::ToInt32($Data, 0)
-            $Type = [BitConverter]::ToInt32($Data, 4)
-
-            $Body = [Text.Encoding]::UTF8.GetString(
-              $Data,
-              8,
-              $Length - 10
-            )
-
             return [PSCustomObject]@{
-              Id = $Id
-              Type = $Type
-              Body = $Body
+              Id = [BitConverter]::ToInt32($Data, 0)
+              Type = [BitConverter]::ToInt32($Data, 4)
+              Body = [Text.Encoding]::UTF8.GetString($Data, 8, $Length - 10)
             }
           }
 
@@ -590,18 +682,12 @@ jobs:
             }
           }
 
-          # ============================================
-          # STOP SERVER
-          # ============================================
-
           Write-Host "Checking Minecraft server..."
 
           $PortOpen = Test-RconPort
 
           if (!$PortOpen) {
-            $JavaProcesses = @(
-              Get-Process -Name java,javaw -ErrorAction SilentlyContinue
-            )
+            $JavaProcesses = @(Get-Process java,javaw -ErrorAction SilentlyContinue)
 
             if ($JavaProcesses.Count -gt 0) {
               $Deadline = (Get-Date).AddSeconds(60)
@@ -615,7 +701,7 @@ jobs:
           }
 
           if ($PortOpen) {
-            Write-Host "RCON detected. Sending stop command..."
+            Write-Host "RCON detected."
 
             $Client = [System.Net.Sockets.TcpClient]::new()
             $Client.ReceiveTimeout = 10000
@@ -624,7 +710,6 @@ jobs:
 
             try {
               $Client.Connect("127.0.0.1", 25575)
-
               $Stream = $Client.GetStream()
               $Stream.ReadTimeout = 10000
               $Stream.WriteTimeout = 10000
@@ -633,20 +718,13 @@ jobs:
 
               $Auth = Read-RconPacket $Stream
 
-              if ($Auth.Id -eq -1) {
+              if ($Auth.Id -eq -1 -or $Auth.Id -ne 1) {
                 throw "RCON authentication failed."
-              }
-
-              if ($Auth.Id -ne 1) {
-                throw "Unexpected RCON authentication response."
               }
 
               Send-RconPacket $Stream 2 2 "stop"
 
-              $Response = Read-RconPacket $Stream
-
-              Write-Host "RCON stop command sent."
-              Write-Host "Response: $($Response.Body)"
+              Write-Host "Stop command sent."
             }
             finally {
               if ($Stream) {
@@ -656,8 +734,6 @@ jobs:
               $Client.Close()
             }
 
-            Write-Host "Waiting for Minecraft shutdown..."
-
             $Deadline = (Get-Date).AddSeconds(120)
 
             while ((Test-RconPort) -and (Get-Date) -lt $Deadline) {
@@ -665,43 +741,25 @@ jobs:
             }
 
             if (Test-RconPort) {
-              throw "Minecraft did not stop. Backup aborted."
+              Add-BackupError "Minecraft did not stop within 120 seconds."
             }
-
-            Write-Host "Minecraft stopped."
+            else {
+              Write-Host "Minecraft stopped."
+            }
           }
           else {
-            $JavaProcesses = @(
-              Get-Process -Name java,javaw -ErrorAction SilentlyContinue
-            )
+            $JavaProcesses = @(Get-Process java,javaw -ErrorAction SilentlyContinue)
 
             if ($JavaProcesses.Count -gt 0) {
-              throw "Java is running but RCON is unavailable. Backup aborted."
+              Add-BackupError "Java is running but RCON is unavailable. World backup may be unsafe."
             }
-
-            Write-Host "No Java process detected."
+            else {
+              Write-Host "No Minecraft Java process detected."
+            }
           }
 
           # ============================================
-          # PREPARE BACKUP
-          # ============================================
-
-          $BackupRoot = "$env:RUNNER_TEMP\FullEmergencyBackup"
-          $ZipDir = "$env:RUNNER_TEMP\BackupArchives"
-          $LogDir = "$env:RUNNER_TEMP\BackupLogs"
-          $ShaPath = "$env:RUNNER_TEMP\Minecraft-EmergencyBackup.sha256"
-
-          Remove-Item $BackupRoot -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item $ZipDir -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item $LogDir -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item $ShaPath -Force -ErrorAction SilentlyContinue
-
-          New-Item -ItemType Directory -Force -Path $BackupRoot | Out-Null
-          New-Item -ItemType Directory -Force -Path $ZipDir | Out-Null
-          New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-
-          # ============================================
-          # ROBUST ROBOCOPY HELPER
+          # ROBOCOPY FUNCTION
           # ============================================
 
           function Copy-BackupFolder {
@@ -712,13 +770,10 @@ jobs:
             )
 
             Write-Host ""
-            Write-Host "======================================"
             Write-Host "Backing up: $Label"
-            Write-Host "Source: $Source"
-            Write-Host "======================================"
 
             if (!(Test-Path $Source)) {
-              Write-Warning "Source does not exist: $Source"
+              Write-Warning "Folder does not exist: $Source"
               New-Item -ItemType Directory -Force -Path $Destination | Out-Null
               return
             }
@@ -728,197 +783,183 @@ jobs:
             $SafeLabel = $Label -replace '[^a-zA-Z0-9_-]', '_'
             $LogFile = Join-Path $LogDir "$SafeLabel.log"
 
-            robocopy $Source $Destination `
+            & robocopy.exe $Source $Destination `
               /E /COPY:DAT /DCOPY:DAT `
-              /ZB /R:5 /W:3 /XJ /SL `
-              /V /FP /TS `
-              /TEE "/LOG:$LogFile"
+              /ZB /R:3 /W:2 /XJ `
+              /NFL /NDL /NP `
+              "/LOG:$LogFile"
 
             $CopyCode = $LASTEXITCODE
             $global:LASTEXITCODE = 0
 
-            Write-Host ""
             Write-Host "$Label Robocopy code: $CopyCode"
-            Write-Host "Log: $LogFile"
 
             if ($CopyCode -ge 8) {
-              Write-Warning "Robocopy reported errors for $Label."
+              Add-BackupError "$Label Robocopy failed with code $CopyCode."
 
-              Write-Host "Failed file details:"
+              Write-Host "Relevant errors from $Label :"
 
-              Get-Content $LogFile |
-                Select-String -Pattern 'ERROR|Access is denied|The process cannot access|FAILED|ERROR [0-9]+' |
+              Get-Content $LogFile -ErrorAction SilentlyContinue |
+                Select-String -Pattern 'ERROR|Access is denied|cannot access|FAILED' |
+                Select-Object -First 100 |
                 ForEach-Object {
                   Write-Host $_.Line
                 }
-
-              throw "$Label backup failed. Robocopy code: $CopyCode. Check log: $LogFile"
             }
-
-            Write-Host "$Label backup completed."
           }
 
           # ============================================
-          # DESKTOP
+          # BACKUP FOLDERS
           # ============================================
 
-          Copy-BackupFolder `
-            "$env:DESKTOP_DIR" `
-            "$BackupRoot\Desktop" `
-            "Desktop"
+          $Mappings = @(
+            @{ Source = $env:DESKTOP_DIR; Destination = "$BackupRoot\Desktop"; Label = "Desktop" },
+            @{ Source = "$env:PROFILE_DIR\AppData\Roaming"; Destination = "$BackupRoot\AppData\Roaming"; Label = "AppData_Roaming" },
+            @{ Source = "$env:PROFILE_DIR\AppData\Local"; Destination = "$BackupRoot\AppData\Local"; Label = "AppData_Local" },
+            @{ Source = "$env:PROFILE_DIR\AppData\LocalLow"; Destination = "$BackupRoot\AppData\LocalLow"; Label = "AppData_LocalLow" },
+            @{ Source = "C:\ProgramData"; Destination = "$BackupRoot\ProgramData"; Label = "ProgramData" },
+            @{ Source = "$env:PROFILE_DIR\Documents"; Destination = "$BackupRoot\Documents"; Label = "Documents" },
+            @{ Source = "$env:PROFILE_DIR\Saved Games"; Destination = "$BackupRoot\Saved Games"; Label = "Saved_Games" }
+          )
 
-          # ============================================
-          # APPLICATION DATA
-          # ============================================
-
-          Copy-BackupFolder `
-            "$env:PROFILE_DIR\AppData\Roaming" `
-            "$BackupRoot\AppData\Roaming" `
-            "AppData_Roaming"
-
-          Copy-BackupFolder `
-            "$env:PROFILE_DIR\AppData\Local" `
-            "$BackupRoot\AppData\Local" `
-            "AppData_Local"
-
-          Copy-BackupFolder `
-            "$env:PROFILE_DIR\AppData\LocalLow" `
-            "$BackupRoot\AppData\LocalLow" `
-            "AppData_LocalLow"
-
-          # ============================================
-          # PROGRAM DATA
-          # ============================================
-
-          Copy-BackupFolder `
-            "C:\ProgramData" `
-            "$BackupRoot\ProgramData" `
-            "ProgramData"
-
-          # ============================================
-          # DOCUMENTS
-          # ============================================
-
-          Copy-BackupFolder `
-            "$env:PROFILE_DIR\Documents" `
-            "$BackupRoot\Documents" `
-            "Documents"
-
-          # ============================================
-          # SAVED GAMES
-          # ============================================
-
-          Copy-BackupFolder `
-            "$env:PROFILE_DIR\Saved Games" `
-            "$BackupRoot\Saved Games" `
-            "Saved_Games"
+          foreach ($Mapping in $Mappings) {
+            try {
+              Copy-BackupFolder `
+                $Mapping.Source `
+                $Mapping.Destination `
+                $Mapping.Label
+            }
+            catch {
+              Add-BackupError "$($Mapping.Label): $($_.Exception.Message)"
+            }
+          }
 
           # ============================================
           # REGISTRY BACKUP
           # ============================================
 
-          Write-Host ""
-          Write-Host "Exporting registry..."
-
-          $RegistryDir = "$BackupRoot\Registry"
-
-          New-Item -ItemType Directory -Force -Path $RegistryDir | Out-Null
-
-          $Profile = Get-CimInstance Win32_UserProfile |
-            Where-Object { $_.LocalPath -eq $env:PROFILE_DIR } |
-            Select-Object -First 1
-
-          if ($null -eq $Profile) {
-            throw "Could not find NvDAdmin Windows profile SID."
-          }
-
-          $UserSID = $Profile.SID
-          $HiveName = "HKU\$UserSID"
-          $TemporaryHive = $false
-
-          & reg.exe query $HiveName 2>$null
-
-          $LoadedCode = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
-
-          if ($LoadedCode -ne 0) {
-            $NtUser = Join-Path $env:PROFILE_DIR "NTUSER.DAT"
-
-            if (!(Test-Path $NtUser)) {
-              throw "NTUSER.DAT not found."
-            }
-
-            & reg.exe load "HKU\NvDAdminBackupTemp" $NtUser
-
-            $LoadCode = $LASTEXITCODE
-            $global:LASTEXITCODE = 0
-
-            if ($LoadCode -ne 0) {
-              throw "Could not load user registry hive."
-            }
-
-            $HiveName = "HKU\NvDAdminBackupTemp"
-            $TemporaryHive = $true
-          }
-
           try {
-            & reg.exe export $HiveName "$RegistryDir\NvDAdmin-User-Registry.reg" /y
+            Write-Host "Exporting registry..."
 
-            $RegCode = $LASTEXITCODE
+            $RegistryDir = "$BackupRoot\Registry"
+            New-Item -ItemType Directory -Force -Path $RegistryDir | Out-Null
+
+            $Profile = Get-CimInstance Win32_UserProfile |
+              Where-Object { $_.LocalPath -eq $env:PROFILE_DIR } |
+              Select-Object -First 1
+
+            if ($null -eq $Profile) {
+              throw "Could not find NvDAdmin profile SID."
+            }
+
+            $HiveName = "HKU\$($Profile.SID)"
+            $TemporaryHive = $false
+
+            & reg.exe query $HiveName 2>$null
+
+            $Code = $LASTEXITCODE
             $global:LASTEXITCODE = 0
 
-            if ($RegCode -ne 0) {
-              throw "User registry export failed."
-            }
-          }
-          finally {
-            if ($TemporaryHive) {
-              & reg.exe unload "HKU\NvDAdminBackupTemp"
+            if ($Code -ne 0) {
+              $NtUser = Join-Path $env:PROFILE_DIR "NTUSER.DAT"
 
-              $UnloadCode = $LASTEXITCODE
+              if (!(Test-Path $NtUser)) {
+                throw "NTUSER.DAT not found."
+              }
+
+              & reg.exe load "HKU\NvDAdminBackupTemp" $NtUser
+
+              $Code = $LASTEXITCODE
               $global:LASTEXITCODE = 0
 
-              if ($UnloadCode -ne 0) {
-                Write-Warning "Temporary registry hive could not be unloaded."
+              if ($Code -ne 0) {
+                throw "Could not load user registry hive."
               }
+
+              $HiveName = "HKU\NvDAdminBackupTemp"
+              $TemporaryHive = $true
+            }
+
+            try {
+              & reg.exe export $HiveName "$RegistryDir\NvDAdmin-User-Registry.reg" /y
+
+              $Code = $LASTEXITCODE
+              $global:LASTEXITCODE = 0
+
+              if ($Code -ne 0) {
+                throw "User registry export failed."
+              }
+            }
+            finally {
+              if ($TemporaryHive) {
+                & reg.exe unload "HKU\NvDAdminBackupTemp"
+
+                $global:LASTEXITCODE = 0
+              }
+            }
+
+            & reg.exe export "HKLM\SOFTWARE" "$RegistryDir\HKLM-Software.reg" /y
+
+            $Code = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+
+            if ($Code -ne 0) {
+              throw "HKLM registry export failed."
+            }
+
+            & reg.exe export "HKLM\SOFTWARE\WOW6432Node" "$RegistryDir\HKLM-WOW6432Node.reg" /y
+
+            $global:LASTEXITCODE = 0
+
+            Write-Host "Registry export completed."
+          }
+          catch {
+            Add-BackupError "Registry: $($_.Exception.Message)"
+          }
+
+          # ============================================
+          # REPORT
+          # ============================================
+
+          $Report = @(
+            "Minecraft Emergency Backup Report"
+            "Run ID: $env:GITHUB_RUN_ID"
+            "Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            "Repository: $env:GITHUB_REPOSITORY"
+            ""
+            "Errors: $($script:BackupErrors.Count)"
+            ""
+            $script:BackupErrors
+          )
+
+          $Report | Set-Content -Path $ReportPath -Encoding UTF8
+
+          # ============================================
+          # COPY LOGS
+          # ============================================
+
+          if (Test-Path $LogDir) {
+            New-Item -ItemType Directory -Force -Path "$BackupRoot\Logs" | Out-Null
+
+            Get-ChildItem $LogDir -File | ForEach-Object {
+              Copy-Item $_.FullName "$BackupRoot\Logs" -Force
             }
           }
 
-          & reg.exe export "HKLM\SOFTWARE" "$RegistryDir\HKLM-Software.reg" /y
+          # ============================================
+          # FAIL IF ANY BACKUP ERROR
+          # ============================================
 
-          $RegCode = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
-
-          if ($RegCode -ne 0) {
-            throw "HKLM Software export failed."
+          if ($script:BackupErrors.Count -gt 0) {
+            Write-Host ""
+            Write-Host "BACKUP INCOMPLETE"
+            Write-Host "Errors: $($script:BackupErrors.Count)"
+            throw "Backup incomplete. Release will not be created."
           }
 
-          & reg.exe export "HKLM\SOFTWARE\WOW6432Node" "$RegistryDir\HKLM-WOW6432Node.reg" /y
-
-          $RegCode = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
-
-          if ($RegCode -ne 0) {
-            Write-Warning "WOW6432Node registry export was unavailable."
-          }
-
-          Write-Host "Registry export completed."
-
           # ============================================
-          # ADD LOGS TO BACKUP
+          # CREATE ZIP FILES
           # ============================================
-
-          Copy-BackupFolder `
-            "$LogDir" `
-            "$BackupRoot\Logs" `
-            "Backup_Logs"
-
-          # ============================================
-          # CREATE ZIP ARCHIVES
-          # ============================================
-
-          Write-Host ""
-          Write-Host "Creating ZIP archives..."
 
           $Folders = @(
             "Desktop",
@@ -943,10 +984,10 @@ jobs:
 
             tar.exe -a -c -f $ZipPath -C $BackupRoot $Folder
 
-            $TarCode = $LASTEXITCODE
+            $Code = $LASTEXITCODE
             $global:LASTEXITCODE = 0
 
-            if ($TarCode -ne 0 -or !(Test-Path $ZipPath)) {
+            if ($Code -ne 0 -or !(Test-Path $ZipPath)) {
               throw "Archive creation failed: $ZipName"
             }
 
@@ -954,11 +995,8 @@ jobs:
           }
 
           # ============================================
-          # SHA256 MANIFEST
+          # SHA256
           # ============================================
-
-          Write-Host ""
-          Write-Host "Calculating SHA256..."
 
           $Manifest = @()
 
@@ -967,21 +1005,15 @@ jobs:
             $Hash = (Get-FileHash $Path -Algorithm SHA256).Hash
 
             $Manifest += "$Hash  $Name"
-
-            Write-Host "$Name : $Hash"
           }
 
           $Manifest | Set-Content -Path $ShaPath -Encoding ASCII
 
           # ============================================
-          # UPLOAD RELEASE
+          # RELEASE UPLOAD
           # ============================================
 
-          $Repository = $env:GITHUB_REPOSITORY
           $Tag = "minecraft-backup-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-
-          Write-Host ""
-          Write-Host "Uploading backup to GitHub Release..."
 
           $Assets = @()
 
@@ -993,15 +1025,15 @@ jobs:
 
           gh release create $Tag `
             $Assets `
-            --repo $Repository `
+            --repo $env:GITHUB_REPOSITORY `
             --title "Minecraft Full Emergency Backup" `
-            --notes "Full backup of Desktop, Minecraft, AppData, ProgramData, Documents, Saved Games, Registry and backup logs."
+            --notes "Verified full emergency backup."
 
-          $ReleaseCode = $LASTEXITCODE
+          $Code = $LASTEXITCODE
           $global:LASTEXITCODE = 0
 
-          if ($ReleaseCode -ne 0) {
-            throw "GitHub Release upload failed. Runner will not shut down."
+          if ($Code -ne 0) {
+            throw "GitHub Release upload failed."
           }
 
           Write-Host ""
@@ -1011,17 +1043,19 @@ jobs:
           Write-Host "Archives: $($ArchiveNames.Count)"
           Write-Host "======================================"
 
-          # ============================================
-          # SHUTDOWN
-          # ============================================
+      # ================================================
+      # 9. UPLOAD DIAGNOSTIC LOGS
+      # ================================================
 
-          Write-Host "Windows runner will shut down in 30 seconds."
-
-          shutdown.exe /s /t 30 /f
-
-          $ShutdownCode = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
-
-          if ($ShutdownCode -ne 0) {
-            throw "Windows shutdown command failed."
-          }
+      - name: Upload backup diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minecraft-backup-diagnostics-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}\BackupLogs\
+            ${{ runner.temp }}\BackupReport.txt
+            ${{ runner.temp }}\ngrok.log
+            ${{ runner.temp }}\ngrok-error.log
+          if-no-files-found: warn
+          retention-days: 7
