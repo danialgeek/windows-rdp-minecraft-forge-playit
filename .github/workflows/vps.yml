@@ -1,5 +1,4 @@
-
-name: Windows RDP + Minecraft Forge + Tailscale + ngrok + Full Backup
+name: Windows RDP + Minecraft Forge + Tailscale Funnel + Full Backup
 
 on:
   workflow_dispatch:
@@ -156,57 +155,27 @@ jobs:
           Write-Host "TAILSCALE RDP IP: $IP"
 
       # ================================================
-      # 4. NGROK TCP RDP
+      # 4. TAILSCALE FUNNEL TCP RDP
       # ================================================
 
-      - name: Install and start ngrok TCP tunnel
+      - name: Start Tailscale Funnel TCP tunnel for RDP
         shell: pwsh
-        env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
 
-          $Token = $env:NGROK_AUTHTOKEN
+          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          if ([string]::IsNullOrWhiteSpace($Token)) {
-            throw "NGROK_AUTHTOKEN secret is missing."
+          if (!(Test-Path $Tailscale)) {
+            throw "Tailscale executable was not found."
           }
 
-          $Token = $Token.Trim()
+          Write-Host "Checking RDP service..."
 
-          $NgrokDir = "$env:RUNNER_TEMP\ngrok"
-          New-Item -ItemType Directory -Force -Path $NgrokDir | Out-Null
-
-          $Zip = "$env:RUNNER_TEMP\ngrok.zip"
-
-          Invoke-WebRequest `
-            -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
-            -OutFile $Zip
-
-          Expand-Archive -Path $Zip -DestinationPath $NgrokDir -Force
-
-          $Ngrok = Join-Path $NgrokDir "ngrok.exe"
-
-          if (!(Test-Path $Ngrok)) {
-            throw "ngrok executable was not found."
+          $Service = Get-Service -Name "TermService" -ErrorAction Stop
+          if ($Service.Status -ne "Running") {
+            Start-Service -Name "TermService"
           }
-
-          Write-Host "Configuring ngrok authentication..."
-
-          & $Ngrok config add-authtoken $Token
-
-          $TokenCode = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
-
-          $Token = $null
-          $env:NGROK_AUTHTOKEN = $null
-
-          if ($TokenCode -ne 0) {
-            throw "Could not configure ngrok authtoken. Check NGROK_AUTHTOKEN secret."
-          }
-
-          # Verify RDP service is listening before starting the tunnel.
 
           $Deadline = (Get-Date).AddSeconds(60)
           $RdpReady = $false
@@ -223,65 +192,67 @@ jobs:
           }
 
           if (!$RdpReady) {
-            throw "RDP port 3389 is not listening."
+            throw "RDP port 3389 is not listening. Check TermService and Windows Firewall."
           }
 
-          $NgrokLog = "$env:RUNNER_TEMP\ngrok.log"
-          $NgrokError = "$env:RUNNER_TEMP\ngrok-error.log"
+          Write-Host "Checking Tailscale connection..."
 
-          $Process = Start-Process `
-            -FilePath $Ngrok `
-            -ArgumentList @("tcp", "3389", "--log=stdout", "--log-level=info") `
-            -PassThru `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput $NgrokLog `
-            -RedirectStandardError $NgrokError
+          $StatusJson = & $Tailscale status --json
+          $Code = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
 
-          Write-Host "Waiting for ngrok endpoint..."
-
-          $Endpoint = $null
-          $Deadline = (Get-Date).AddSeconds(60)
-
-          while ((Get-Date) -lt $Deadline) {
-            if ($Process.HasExited) {
-              Get-Content $NgrokLog -ErrorAction SilentlyContinue
-              Get-Content $NgrokError -ErrorAction SilentlyContinue
-              throw "ngrok exited unexpectedly."
-            }
-
-            try {
-              $Api = Invoke-RestMethod `
-                -Uri "http://127.0.0.1:4040/api/tunnels" `
-                -TimeoutSec 3
-
-              $Tunnel = $Api.tunnels |
-                Where-Object { $_.proto -eq "tcp" } |
-                Select-Object -First 1
-
-              if ($Tunnel) {
-                $Endpoint = $Tunnel.public_url
-                break
-              }
-            }
-            catch {}
-
-            Start-Sleep -Seconds 2
+          if ($Code -ne 0) {
+            throw "Could not read Tailscale status."
           }
 
-          if (!$Endpoint) {
-            Get-Content $NgrokLog -ErrorAction SilentlyContinue
-            Get-Content $NgrokError -ErrorAction SilentlyContinue
-            throw "Could not obtain ngrok TCP address."
+          $Status = $StatusJson | ConvertFrom-Json
+
+          if (!$Status.Self.Online) {
+            throw "Tailscale is not online."
           }
+
+          $DnsName = ([string]$Status.Self.DNSName).TrimEnd(".")
+
+          if ([string]::IsNullOrWhiteSpace($DnsName)) {
+            throw "Could not obtain this runner's Tailscale DNS name."
+          }
+
+          Write-Host "Starting Tailscale Funnel on public TCP port 10000..."
+
+          & $Tailscale funnel --tcp=10000 --bg --yes "tcp://127.0.0.1:3389"
+
+          $FunnelCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+
+          if ($FunnelCode -ne 0) {
+            throw "Tailscale Funnel failed. Check MagicDNS, HTTPS certificates, and Funnel access policy."
+          }
+
+          Start-Sleep -Seconds 5
+
+          Write-Host "Verifying Funnel configuration..."
+
+          $FunnelStatus = & $Tailscale funnel status
+          $Code = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+
+          $FunnelStatus | ForEach-Object { Write-Host $_ }
+
+          if ($Code -ne 0) {
+            throw "Could not verify Tailscale Funnel status."
+          }
+
+          $PublicAddress = "${DnsName}:10000"
+
+          Add-Content $env:GITHUB_ENV "RDP_PUBLIC_ADDRESS=$PublicAddress"
 
           Write-Host ""
-          Write-Host "======================================"
-          Write-Host "NGROK RDP ADDRESS:"
-          Write-Host $Endpoint
+          Write-Host "=========================================="
+          Write-Host "PUBLIC RDP ADDRESS:"
+          Write-Host $PublicAddress
           Write-Host "USERNAME: NvDAdmin"
-          Write-Host "======================================"
-
-          Add-Content $env:GITHUB_ENV "NGROK_RDP_ADDRESS=$Endpoint"
+          Write-Host "PORT: 10000"
+          Write-Host "=========================================="
 
       # ================================================
       # 5. RESTORE LATEST BACKUP
@@ -576,9 +547,9 @@ jobs:
         run: |
           Write-Host "======================================"
           Write-Host "RDP IS READY"
-          Write-Host "Tailscale and ngrok are connected."
+          Write-Host "Tailscale and Funnel are connected."
           Write-Host "Start Minecraft manually from desktop."
-          Write-Host "Press Cancel workflow to request backup."
+          Write-Host "Use Cancel workflow to request an emergency backup (best effort)."
           Write-Host "======================================"
 
           while ($true) {
@@ -937,13 +908,23 @@ jobs:
               throw "HKLM registry export failed."
             }
 
-            & reg.exe export "HKLM\SOFTWARE\WOW6432Node" "$RegistryDir\HKLM-WOW6432Node.reg" /y
+            & reg.exe query "HKLM\SOFTWARE\WOW6432Node" *> $null
 
             $Code = $LASTEXITCODE
             $global:LASTEXITCODE = 0
 
-            if ($Code -ne 0) {
-              throw "HKLM WOW6432Node registry export failed."
+            if ($Code -eq 0) {
+              & reg.exe export "HKLM\SOFTWARE\WOW6432Node" "$RegistryDir\HKLM-WOW6432Node.reg" /y
+
+              $Code = $LASTEXITCODE
+              $global:LASTEXITCODE = 0
+
+              if ($Code -ne 0) {
+                throw "HKLM WOW6432Node registry export failed."
+              }
+            }
+            else {
+              Write-Warning "HKLM\SOFTWARE\WOW6432Node does not exist. Skipping this optional export."
             }
 
             Write-Host "Registry export completed."
@@ -1090,7 +1071,5 @@ jobs:
           path: |
             ${{ runner.temp }}/BackupLogs/**
             ${{ runner.temp }}/BackupReport.txt
-            ${{ runner.temp }}/ngrok.log
-            ${{ runner.temp }}/ngrok-error.log
           if-no-files-found: warn
           retention-days: 7
