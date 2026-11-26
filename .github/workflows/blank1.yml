@@ -966,43 +966,58 @@ jobs:
 
             $OutLog = Join-Path $env:RUNNER_TEMP "$Name-bore-out.log"
             $ErrLog = Join-Path $env:RUNNER_TEMP "$Name-bore-err.log"
-            Remove-Item $OutLog,$ErrLog -Force -ErrorAction SilentlyContinue
+            $Launcher = Join-Path $env:RUNNER_TEMP "$Name-bore-launch.cmd"
+            Remove-Item $OutLog,$ErrLog,$Launcher -Force -ErrorAction SilentlyContinue
 
             $BoreArgs = @("local", [string]$LocalPort, "--local-host", "127.0.0.1", "--to", "bore.pub") + $ExtraArgs
-            $Process = Start-Process -FilePath $Bore `
-              -ArgumentList $BoreArgs `
-              -PassThru `
-              -RedirectStandardOutput $OutLog `
-              -RedirectStandardError $ErrLog
+            $ArgumentText = ($BoreArgs | ForEach-Object { [string]$_ }) -join ' '
+            $CommandLine = '"' + $Bore + '" ' + $ArgumentText + ' 1> "' + $OutLog + '" 2> "' + $ErrLog + '"'
+            Set-Content -Path $Launcher -Value "@echo off`r`n$CommandLine`r`n" -Encoding ASCII
+
+            # Run Bore as a SYSTEM scheduled task. A normal Start-Process child can
+            # be reaped when a GitHub Actions step ends, even if it reported a port.
+            $TaskName = "GitHubBore-$Name-$env:GITHUB_RUN_ID"
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+            $Action = New-ScheduledTaskAction `
+              -Execute "$env:SystemRoot\System32\cmd.exe" `
+              -Argument "/d /c `"$Launcher`"" `
+              -WorkingDirectory (Split-Path $Bore -Parent)
+            $Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+            $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+            $Settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable
+            Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force | Out-Null
+            Start-ScheduledTask -TaskName $TaskName
 
             $Deadline = (Get-Date).AddSeconds(60)
             $PublicPort = $null
-
             while ((Get-Date) -lt $Deadline) {
-              if ($Process.HasExited) {
-                Get-Content $OutLog,$ErrLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-                throw "Bore tunnel $Name exited unexpectedly."
-              }
-
               $Combined = ((Get-Content $OutLog,$ErrLog -ErrorAction SilentlyContinue) -join "`n")
               if ($Combined -match 'listening at bore\.pub:(\d+)') {
                 $PublicPort = [int]$Matches[1]
                 break
               }
+
+              $Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+              if ($Task -and $Task.State -ne 'Running' -and ((Get-Content $OutLog,$ErrLog -ErrorAction SilentlyContinue | Measure-Object -Line).Lines -gt 0)) {
+                Get-Content $OutLog,$ErrLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                throw "Bore tunnel $Name scheduled task exited before publishing a port."
+              }
               Start-Sleep -Seconds 2
             }
 
             if (!$PublicPort) {
-              if (!$Process.HasExited) {
-                Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
-              }
+              Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+              Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
               Get-Content $OutLog,$ErrLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
               throw "Bore tunnel $Name did not report a public port."
             }
 
-            Add-Content $env:GITHUB_ENV "$($Name.ToUpperInvariant())_PID=$($Process.Id)"
+            $TaskEnvName = "$($Name.ToUpperInvariant())_TASK"
+            Add-Content $env:GITHUB_ENV "$TaskEnvName=$TaskName"
             Add-Content $env:GITHUB_ENV "$($Name.ToUpperInvariant())_PORT=$PublicPort"
             Write-Host "$Name PUBLIC ADDRESS: bore.pub:$PublicPort"
+            Write-Host "$Name Bore task: $TaskName"
             return $PublicPort
           }
 
@@ -1112,10 +1127,18 @@ jobs:
           }
 
           function Assert-BoreProcess {
-            param([string]$Name, [string]$ProcessId)
-            $Id = 0
-            if (![int]::TryParse($ProcessId, [ref]$Id) -or $Id -le 0 -or !(Get-Process -Id $Id -ErrorAction SilentlyContinue)) {
-              throw "$Name Bore process is not running (PID: $ProcessId)."
+            param([string]$Name, [string]$TaskName)
+            if ([string]::IsNullOrWhiteSpace($TaskName)) {
+              throw "$Name Bore scheduled-task name is missing."
+            }
+            $Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+            if ($null -eq $Task -or $Task.State -ne 'Running') {
+              $OutLog = Join-Path $env:RUNNER_TEMP "BORE_$($Name.ToUpperInvariant())-bore-out.log"
+              $ErrLog = Join-Path $env:RUNNER_TEMP "BORE_$($Name.ToUpperInvariant())-bore-err.log"
+              Write-Host "--- $Name Bore task status ---"
+              if ($Task) { $Task | Format-List TaskName,State | Out-String | Write-Host }
+              Get-Content $OutLog,$ErrLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+              throw "$Name Bore scheduled task is not running: $TaskName."
             }
           }
 
@@ -1124,8 +1147,8 @@ jobs:
           # authoritative health check for the panel.
           Assert-Service -Name "3X-UI" -Port 2053
           Assert-Service -Name "RDP" -Port 3389
-          Assert-BoreProcess -Name "RDP" -ProcessId $env:BORE_RDP_PID
-          Assert-BoreProcess -Name "VLESS" -ProcessId $env:BORE_VLESS_PID
+          Assert-BoreProcess -Name "RDP" -TaskName $env:BORE_RDP_TASK
+          Assert-BoreProcess -Name "VLESS" -TaskName $env:BORE_VLESS_TASK
 
           Write-Host "=============================================="
           Write-Host "RDP via Bore: bore.pub:$env:BORE_RDP_PORT"
@@ -1155,8 +1178,8 @@ jobs:
           while (!(Test-Path $Marker)) {
             Assert-Service -Name "3X-UI" -Port 2053
             Assert-Service -Name "RDP" -Port 3389
-            Assert-BoreProcess -Name "RDP" -ProcessId $env:BORE_RDP_PID
-            Assert-BoreProcess -Name "VLESS" -ProcessId $env:BORE_VLESS_PID
+            Assert-BoreProcess -Name "RDP" -TaskName $env:BORE_RDP_TASK
+            Assert-BoreProcess -Name "VLESS" -TaskName $env:BORE_VLESS_TASK
             Start-Sleep -Seconds 5
           }
 
@@ -1201,8 +1224,8 @@ jobs:
           while ($true) {
             Assert-Service -Name "3X-UI" -Port 2053
             Assert-Service -Name "RDP" -Port 3389
-            Assert-BoreProcess -Name "RDP" -ProcessId $env:BORE_RDP_PID
-            Assert-BoreProcess -Name "VLESS" -ProcessId $env:BORE_VLESS_PID
+            Assert-BoreProcess -Name "RDP" -TaskName $env:BORE_RDP_TASK
+            Assert-BoreProcess -Name "VLESS" -TaskName $env:BORE_VLESS_TASK
             if ($PanelTunnel.HasExited) {
               Get-Content $PanelTunnelOut,$PanelTunnelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
               throw "Public 3X-UI Bore tunnel process stopped."
