@@ -77,6 +77,9 @@ jobs:
             -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
             -Name "UserAuthentication" -Value 1
 
+          Set-Service -Name "TermService" -StartupType Automatic
+          Start-Service -Name "TermService"
+
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
           $Credential = [PSCredential]::new(".\NvDAdmin", $Password)
@@ -164,9 +167,13 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
 
-          if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTHTOKEN)) {
+          $Token = $env:NGROK_AUTHTOKEN
+
+          if ([string]::IsNullOrWhiteSpace($Token)) {
             throw "NGROK_AUTHTOKEN secret is missing."
           }
+
+          $Token = $Token.Trim()
 
           $NgrokDir = "$env:RUNNER_TEMP\ngrok"
           New-Item -ItemType Directory -Force -Path $NgrokDir | Out-Null
@@ -185,18 +192,33 @@ jobs:
             throw "ngrok executable was not found."
           }
 
-          $env:NGROK_AUTHTOKEN | & $Ngrok config add-authtoken stdin
+          Write-Host "Configuring ngrok authentication..."
+
+          & $Ngrok config add-authtoken $Token
+
+          $TokenCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+
+          $Token = $null
+          $env:NGROK_AUTHTOKEN = $null
+
+          if ($TokenCode -ne 0) {
+            throw "Could not configure ngrok authtoken. Check NGROK_AUTHTOKEN secret."
+          }
 
           # Verify RDP service is listening before starting the tunnel.
-          $Deadline = (Get-Date).AddSeconds(45)
+
+          $Deadline = (Get-Date).AddSeconds(60)
           $RdpReady = $false
 
           while ((Get-Date) -lt $Deadline) {
             $Test = Test-NetConnection 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
+
             if ($Test.TcpTestSucceeded) {
               $RdpReady = $true
               break
             }
+
             Start-Sleep -Seconds 3
           }
 
@@ -248,6 +270,7 @@ jobs:
 
           if (!$Endpoint) {
             Get-Content $NgrokLog -ErrorAction SilentlyContinue
+            Get-Content $NgrokError -ErrorAction SilentlyContinue
             throw "Could not obtain ngrok TCP address."
           }
 
@@ -570,7 +593,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
           $PSNativeCommandUseErrorActionPreference = $false
 
           $BackupRoot = "$env:RUNNER_TEMP\FullEmergencyBackup"
@@ -593,7 +616,7 @@ jobs:
           }
 
           # ============================================
-          # RCON
+          # RCON FUNCTIONS
           # ============================================
 
           function Read-ExactBytes {
@@ -682,80 +705,89 @@ jobs:
             }
           }
 
-          Write-Host "Checking Minecraft server..."
+          # ============================================
+          # STOP MINECRAFT
+          # ============================================
 
-          $PortOpen = Test-RconPort
+          try {
+            Write-Host "Checking Minecraft server..."
 
-          if (!$PortOpen) {
-            $JavaProcesses = @(Get-Process java,javaw -ErrorAction SilentlyContinue)
+            $PortOpen = Test-RconPort
 
-            if ($JavaProcesses.Count -gt 0) {
-              $Deadline = (Get-Date).AddSeconds(60)
+            if (!$PortOpen) {
+              $JavaProcesses = @(Get-Process java,javaw -ErrorAction SilentlyContinue)
 
-              while (!(Test-RconPort) -and (Get-Date) -lt $Deadline) {
+              if ($JavaProcesses.Count -gt 0) {
+                $Deadline = (Get-Date).AddSeconds(60)
+
+                while (!(Test-RconPort) -and (Get-Date) -lt $Deadline) {
+                  Start-Sleep -Seconds 2
+                }
+
+                $PortOpen = Test-RconPort
+              }
+            }
+
+            if ($PortOpen) {
+              Write-Host "RCON detected."
+
+              $Client = [System.Net.Sockets.TcpClient]::new()
+              $Client.ReceiveTimeout = 10000
+              $Client.SendTimeout = 10000
+              $Stream = $null
+
+              try {
+                $Client.Connect("127.0.0.1", 25575)
+                $Stream = $Client.GetStream()
+                $Stream.ReadTimeout = 10000
+                $Stream.WriteTimeout = 10000
+
+                Send-RconPacket $Stream 1 3 $env:RCON_PASSWORD
+
+                $Auth = Read-RconPacket $Stream
+
+                if ($Auth.Id -eq -1 -or $Auth.Id -ne 1) {
+                  throw "RCON authentication failed."
+                }
+
+                Send-RconPacket $Stream 2 2 "stop"
+
+                Write-Host "Stop command sent."
+              }
+              finally {
+                if ($Stream) {
+                  $Stream.Dispose()
+                }
+
+                $Client.Close()
+              }
+
+              $Deadline = (Get-Date).AddSeconds(120)
+
+              while ((Test-RconPort) -and (Get-Date) -lt $Deadline) {
                 Start-Sleep -Seconds 2
               }
 
-              $PortOpen = Test-RconPort
-            }
-          }
-
-          if ($PortOpen) {
-            Write-Host "RCON detected."
-
-            $Client = [System.Net.Sockets.TcpClient]::new()
-            $Client.ReceiveTimeout = 10000
-            $Client.SendTimeout = 10000
-            $Stream = $null
-
-            try {
-              $Client.Connect("127.0.0.1", 25575)
-              $Stream = $Client.GetStream()
-              $Stream.ReadTimeout = 10000
-              $Stream.WriteTimeout = 10000
-
-              Send-RconPacket $Stream 1 3 $env:RCON_PASSWORD
-
-              $Auth = Read-RconPacket $Stream
-
-              if ($Auth.Id -eq -1 -or $Auth.Id -ne 1) {
-                throw "RCON authentication failed."
+              if (Test-RconPort) {
+                Add-BackupError "Minecraft did not stop within 120 seconds."
               }
-
-              Send-RconPacket $Stream 2 2 "stop"
-
-              Write-Host "Stop command sent."
-            }
-            finally {
-              if ($Stream) {
-                $Stream.Dispose()
+              else {
+                Write-Host "Minecraft stopped."
               }
-
-              $Client.Close()
-            }
-
-            $Deadline = (Get-Date).AddSeconds(120)
-
-            while ((Test-RconPort) -and (Get-Date) -lt $Deadline) {
-              Start-Sleep -Seconds 2
-            }
-
-            if (Test-RconPort) {
-              Add-BackupError "Minecraft did not stop within 120 seconds."
             }
             else {
-              Write-Host "Minecraft stopped."
+              $JavaProcesses = @(Get-Process java,javaw -ErrorAction SilentlyContinue)
+
+              if ($JavaProcesses.Count -gt 0) {
+                Add-BackupError "Java is running but RCON is unavailable. World backup may be unsafe."
+              }
+              else {
+                Write-Host "No Minecraft Java process detected."
+              }
             }
           }
-          else {
-            $JavaProcesses = @(Get-Process java,javaw -ErrorAction SilentlyContinue)
-
-            if ($JavaProcesses.Count -gt 0) {
-              Add-BackupError "Java is running but RCON is unavailable. World backup may be unsafe."
-            }
-            else {
-              Write-Host "No Minecraft Java process detected."
-            }
+          catch {
+            Add-BackupError "Minecraft stop error: $($_.Exception.Message)"
           }
 
           # ============================================
@@ -786,7 +818,6 @@ jobs:
             & robocopy.exe $Source $Destination `
               /E /COPY:DAT /DCOPY:DAT `
               /ZB /R:3 /W:2 /XJ `
-              /NFL /NDL /NP `
               "/LOG:$LogFile"
 
             $CopyCode = $LASTEXITCODE
@@ -893,7 +924,6 @@ jobs:
             finally {
               if ($TemporaryHive) {
                 & reg.exe unload "HKU\NvDAdminBackupTemp"
-
                 $global:LASTEXITCODE = 0
               }
             }
@@ -909,7 +939,12 @@ jobs:
 
             & reg.exe export "HKLM\SOFTWARE\WOW6432Node" "$RegistryDir\HKLM-WOW6432Node.reg" /y
 
+            $Code = $LASTEXITCODE
             $global:LASTEXITCODE = 0
+
+            if ($Code -ne 0) {
+              throw "HKLM WOW6432Node registry export failed."
+            }
 
             Write-Host "Registry export completed."
           }
@@ -1053,9 +1088,9 @@ jobs:
         with:
           name: minecraft-backup-diagnostics-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}\BackupLogs\
-            ${{ runner.temp }}\BackupReport.txt
-            ${{ runner.temp }}\ngrok.log
-            ${{ runner.temp }}\ngrok-error.log
+            ${{ runner.temp }}/BackupLogs/**
+            ${{ runner.temp }}/BackupReport.txt
+            ${{ runner.temp }}/ngrok.log
+            ${{ runner.temp }}/ngrok-error.log
           if-no-files-found: warn
           retention-days: 7
