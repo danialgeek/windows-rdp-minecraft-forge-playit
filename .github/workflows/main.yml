@@ -1,5 +1,5 @@
 
-name: Windows RDP + Minecraft Forge + Tailscale
+name: Windows RDP + Minecraft Forge
 
 on:
   workflow_dispatch:
@@ -19,43 +19,24 @@ jobs:
     env:
       DESKTOP_DIR: C:\Users\NvDAdmin\Desktop
       SERVER_DIR: C:\Users\NvDAdmin\Desktop\Minecraft
-      SERVER_USER: NvDAdmin
-      SERVER_VERSION: 1.20.1
-      FORGE_VERSION: 47.4.10
       BACKUP_PREFIX: minecraft-backup-
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
 
-      # ================================================
-      # 1. Checkout
-      # ================================================
-
-      - name: Checkout repository
+      # 1. دریافت مخزن
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # ================================================
-      # 2. Java 17
-      # ================================================
-
+      # 2. نصب Java 17
       - name: Install Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Verify Java
-        shell: pwsh
-        run: |
-          java -version
-          if ($LASTEXITCODE -ne 0) {
-            throw "Java installation failed."
-          }
-
-      # ================================================
-      # 3. RDP User and Profile
-      # ================================================
-
-      - name: Configure RDP User and Windows Profile
+      # 3. ساخت کاربر RDP
+      - name: Configure Windows RDP User
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
@@ -69,72 +50,28 @@ jobs:
           $SecurePassword = ConvertTo-SecureString `
             $env:RDP_PASSWORD -AsPlainText -Force
 
-          $User = Get-LocalUser -Name $env:SERVER_USER `
-            -ErrorAction SilentlyContinue
+          $User = Get-LocalUser -Name "NvDAdmin" -ErrorAction SilentlyContinue
 
-          if ($null -eq $User) {
+          if ($User) {
+            Set-LocalUser -Name "NvDAdmin" -Password $SecurePassword
+          }
+          else {
             New-LocalUser `
-              -Name $env:SERVER_USER `
+              -Name "NvDAdmin" `
               -Password $SecurePassword `
               -PasswordNeverExpires `
               -AccountNeverExpires
           }
-          else {
-            Set-LocalUser `
-              -Name $env:SERVER_USER `
-              -Password $SecurePassword
-
-            Enable-LocalUser -Name $env:SERVER_USER
-          }
 
           Add-LocalGroupMember `
             -Group "Administrators" `
-            -Member $env:SERVER_USER `
+            -Member "NvDAdmin" `
             -ErrorAction SilentlyContinue
 
-          $Credential = New-Object System.Management.Automation.PSCredential(
-            ".\$env:SERVER_USER",
-            $SecurePassword
-          )
-
-          $ProfileProcess = Start-Process `
-            -FilePath "$env:SystemRoot\System32\cmd.exe" `
-            -ArgumentList "/c exit" `
-            -Credential $Credential `
-            -LoadUserProfile `
-            -Wait `
-            -PassThru `
-            -WindowStyle Hidden
-
-          if ($ProfileProcess.ExitCode -ne 0) {
-            throw "Windows profile initialization failed."
-          }
-
-          $UserSid = (Get-LocalUser -Name $env:SERVER_USER).SID.Value
-
-          $Profile = $null
-
-          for ($i = 0; $i -lt 30; $i++) {
-            $Profile = Get-CimInstance Win32_UserProfile |
-              Where-Object { $_.SID -eq $UserSid }
-
-            if ($Profile -and (Test-Path $Profile.LocalPath)) {
-              break
-            }
-
-            Start-Sleep -Seconds 2
-          }
-
-          if (-not $Profile -or -not (Test-Path $Profile.LocalPath)) {
-            throw "Windows profile was not created."
-          }
-
-          $Desktop = Join-Path $Profile.LocalPath "Desktop"
-
-          New-Item -ItemType Directory -Force -Path $Desktop | Out-Null
-
-          Write-Host "Profile: $($Profile.LocalPath)"
-          Write-Host "Desktop: $Desktop"
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "NvDAdmin" `
+            -ErrorAction SilentlyContinue
 
           Set-ItemProperty `
             -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
@@ -146,39 +83,120 @@ jobs:
             -Name "UserAuthentication" `
             -Value 0
 
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" `
-            -ErrorAction SilentlyContinue
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-          Set-Service TermService -StartupType Automatic
-          Start-Service TermService
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
 
-      # ================================================
-      # 4. Restore Full Desktop Backup
-      # ================================================
+          # ایجاد پروفایل واقعی کاربر
+          $Credential = New-Object System.Management.Automation.PSCredential(
+            "NvDAdmin",
+            $SecurePassword
+          )
 
-      - name: Restore Latest Valid Desktop Backup
+          Start-Process `
+            -FilePath "$env:SystemRoot\System32\cmd.exe" `
+            -ArgumentList "/c exit" `
+            -Credential $Credential `
+            -LoadUserProfile `
+            -Wait `
+            -WindowStyle Hidden
+
+          New-Item -ItemType Directory -Force -Path $env:DESKTOP_DIR | Out-Null
+
+          Write-Host "Windows user and profile configured."
+
+      # 4. نصب Tailscale
+      - name: Install Tailscale
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $DesktopDir = $env:DESKTOP_DIR
+          $Msi = Join-Path $env:RUNNER_TEMP "tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $Msi
+
+          $Install = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList "/i `"$Msi`" /qn /norestart" `
+            -Wait `
+            -PassThru
+
+          if ($Install.ExitCode -ne 0) {
+            throw "Tailscale installation failed."
+          }
+
+          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $Tailscale)) {
+            throw "Tailscale executable not found."
+          }
+
+          "TAILSCALE_EXE=$Tailscale" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # 5. اتصال Tailscale
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw "TAILSCALE_AUTHKEY secret is missing."
+          }
+
+          Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+
+          & $env:TAILSCALE_EXE up `
+            "--authkey=$env:TAILSCALE_AUTHKEY" `
+            "--hostname=danialgeek-minecraft" `
+            "--accept-routes"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed."
+          }
+
+          Start-Sleep -Seconds 5
+
+          $IP = & $env:TAILSCALE_EXE ip -4
+
+          if (-not $IP) {
+            throw "Tailscale IP was not obtained."
+          }
+
+          "TAILSCALE_IP=$IP" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+          # محدود کردن RDP به شبکه Tailscale
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
+            Set-NetFirewallRule -RemoteAddress "100.64.0.0/10"
+
+          Write-Host "Tailscale IP: $IP"
+
+      # 6. بازیابی آخرین بکاپ
+      - name: Restore Minecraft Backup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
           $TempDir = Join-Path $env:RUNNER_TEMP "MinecraftRestore"
           $ExtractDir = Join-Path $TempDir "Extracted"
 
-          New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
+          Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue
 
-          if (-not $env:GH_TOKEN) {
-            throw "GitHub token is missing."
-          }
+          New-Item -ItemType Directory -Force -Path $ExtractDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $env:DESKTOP_DIR | Out-Null
 
           $ReleaseJson = gh release list `
             --limit 100 `
             --json tagName,isDraft,isPrerelease
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Could not retrieve releases."
+            throw "Could not retrieve GitHub releases."
           }
 
           $Releases = $ReleaseJson | ConvertFrom-Json
@@ -202,14 +220,12 @@ jobs:
 
             $Tag = $Release.tagName
 
-            Write-Host "Checking release: $Tag"
+            Write-Host "Trying backup: $Tag"
 
-            Remove-Item $TempDir -Recurse -Force `
-              -ErrorAction SilentlyContinue
+            Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $ExtractDir | Out-Null
 
-            New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
-
-            $InfoJson = gh release view $Tag --json assets,body
+            $InfoJson = gh release view $Tag --json assets
 
             if ($LASTEXITCODE -ne 0) {
               Write-Warning "Could not inspect release."
@@ -225,7 +241,7 @@ jobs:
               Select-Object -First 1
 
             if (-not $ZipAsset) {
-              Write-Warning "Backup ZIP asset is missing."
+              Write-Warning "Backup ZIP not found."
               continue
             }
 
@@ -234,14 +250,14 @@ jobs:
               --dir $TempDir
 
             if ($LASTEXITCODE -ne 0) {
-              Write-Warning "ZIP download failed."
+              Write-Warning "Download failed."
               continue
             }
 
             $Zip = Join-Path $TempDir "Minecraft-EmergencyBackup.zip"
 
             if (-not (Test-Path $Zip)) {
-              Write-Warning "ZIP file is missing."
+              Write-Warning "ZIP file does not exist."
               continue
             }
 
@@ -254,148 +270,6 @@ jobs:
               continue
             }
 
-            # بررسی SHA256 در صورت وجود فایل مستقل
-            $HashAsset = $Info.assets |
-              Where-Object {
-                $_.name -eq "Minecraft-EmergencyBackup.sha256"
-              } |
-              Select-Object -First 1
-
-            if ($HashAsset) {
-
-              gh release download $Tag `
-                --pattern "Minecraft-EmergencyBackup.sha256" `
-                --dir $TempDir
-
-              if ($LASTEXITCODE -ne 0) {
-                Write-Warning "SHA256 download failed."
-                continue
-              }
-
-              $HashFile = Join-Path $TempDir "Minecraft-EmergencyBackup.sha256"
-
-              $ExpectedHash = (Get-Content $HashFile -Raw).Trim().Split(" ")[0]
-              $ActualHash = (Get-FileHash $Zip -Algorithm SHA256).Hash
-
-              if ($ExpectedHash -ne $ActualHash) {
-                Write-Warning "SHA256 verification failed."
-                continue
-              }
-
-              Write-Host "SHA256 verified."
-            }
-            else {
-              Write-Warning "No SHA256 asset. ZIP structure will be checked."
-            }
-
-            # فهرست محتویات آرشیو
-            $Entries = @(tar -tf $Zip)
-
-            if ($LASTEXITCODE -ne 0 -or $Entries.Count -eq 0) {
-              Write-Warning "Invalid ZIP archive."
-              continue
-            }
-
-            $NormalizedEntries = @(
-              foreach ($Entry in $Entries) {
-                $Entry.Replace('\', '/').TrimStart('./')
-              }
-            )
-
-            # پیدا کردن run.bat و مسیر پوشه Minecraft
-            $MinecraftRoots = @()
-
-            foreach ($Entry in $NormalizedEntries) {
-
-              if ($Entry -match '(?i)^(.*?)(?:Minecraft)/run\.bat$') {
-
-                $Root = $Matches[1] + "Minecraft"
-
-                $FoundMods = @(
-                  $NormalizedEntries | Where-Object {
-                    $_.StartsWith(
-                      "$Root/mods/",
-                      [StringComparison]::OrdinalIgnoreCase
-                    ) -and $_ -match '(?i)\.jar$'
-                  }
-                )
-
-                if ($FoundMods.Count -ge 10) {
-                  $MinecraftRoots += $Root
-                }
-              }
-            }
-
-            # پشتیبانی از آرشیوی که پوشه Minecraft ندارد
-            if ($MinecraftRoots.Count -eq 0) {
-
-              foreach ($Entry in $NormalizedEntries) {
-
-                if ($Entry -match '(?i)^(.*?)(?:run\.bat)$') {
-
-                  $Root = $Matches[1].TrimEnd('/')
-
-                  $FoundMods = @(
-                    $NormalizedEntries | Where-Object {
-                      $_.StartsWith(
-                        "$Root/mods/",
-                        [StringComparison]::OrdinalIgnoreCase
-                      ) -and $_ -match '(?i)\.jar$'
-                    }
-                  )
-
-                  if ($FoundMods.Count -ge 10) {
-                    $MinecraftRoots += $Root
-                  }
-                }
-              }
-            }
-
-            $MinecraftRoots = @(
-              $MinecraftRoots | Select-Object -Unique
-            )
-
-            if ($MinecraftRoots.Count -ne 1) {
-
-              Write-Warning "Minecraft directory is missing or ambiguous."
-
-              Write-Host "Archive path samples:"
-              $NormalizedEntries |
-                Select-Object -First 100 |
-                ForEach-Object { Write-Host $_ }
-
-              continue
-            }
-
-            $MinecraftRoot = $MinecraftRoots[0]
-
-            Write-Host "Minecraft root: $MinecraftRoot"
-
-            # تعیین ریشه واقعی دسکتاپ در آرشیو
-            $Segments = @($MinecraftRoot -split '/')
-            $DesktopIndex = -1
-
-            for ($i = 0; $i -lt $Segments.Count; $i++) {
-              if ($Segments[$i] -ieq "Desktop") {
-                $DesktopIndex = $i
-              }
-            }
-
-            if ($DesktopIndex -ge 0) {
-              $ArchiveDesktopRoot = (
-                $Segments[0..$DesktopIndex] -join '/'
-              )
-            }
-            else {
-              $ArchiveDesktopRoot = ""
-            }
-
-            # استخراج کامل در مسیر موقت
-            Remove-Item $ExtractDir -Recurse -Force `
-              -ErrorAction SilentlyContinue
-
-            New-Item -ItemType Directory -Force -Path $ExtractDir | Out-Null
-
             tar -xf $Zip -C $ExtractDir
 
             if ($LASTEXITCODE -ne 0) {
@@ -403,681 +277,311 @@ jobs:
               continue
             }
 
-            if ($ArchiveDesktopRoot) {
-              $RestoreRoot = Join-Path $ExtractDir (
-                $ArchiveDesktopRoot.Replace('/', '\')
-              )
+            $Items = @(Get-ChildItem -LiteralPath $ExtractDir -Force)
+
+            if ($Items.Count -eq 0) {
+              Write-Warning "Archive is empty."
+              continue
+            }
+
+            # بکاپ جدید: کل دسکتاپ در ZIP قرار دارد.
+            # بکاپ قدیمی: محتویات پوشه Minecraft مستقیماً در ریشه ZIP است.
+
+            $MinecraftFolder = Join-Path $ExtractDir "Minecraft"
+
+            if (Test-Path $MinecraftFolder -PathType Container) {
+
+              Write-Host "Full desktop backup detected."
+
+              robocopy $ExtractDir $env:DESKTOP_DIR `
+                /E /COPY:DAT /DCOPY:DAT /R:2 /W:2 /XJ
+
+              $CopyCode = $LASTEXITCODE
+
+              if ($CopyCode -ge 8) {
+                Write-Warning "Desktop restore failed."
+                continue
+              }
+
             }
             else {
-              $RestoreRoot = $ExtractDir
+
+              Write-Host "Legacy Minecraft-only backup detected."
+
+              if (Test-Path $env:SERVER_DIR) {
+                Remove-Item $env:SERVER_DIR -Recurse -Force
+              }
+
+              New-Item -ItemType Directory -Force -Path $env:SERVER_DIR | Out-Null
+
+              Get-ChildItem -LiteralPath $ExtractDir -Force |
+                Move-Item -Destination $env:SERVER_DIR
             }
 
-            if (-not (Test-Path $RestoreRoot)) {
-              Write-Warning "Desktop root was not found after extraction."
-              continue
-            }
-
-            $ExtractedMinecraft = Join-Path `
-              $ExtractDir `
-              ($MinecraftRoot.Replace('/', '\'))
-
-            if (-not (Test-Path (Join-Path $ExtractedMinecraft "run.bat"))) {
-              Write-Warning "Minecraft run.bat is missing."
-              continue
-            }
-
-            $ExtractedMods = @(
-              Get-ChildItem `
-                (Join-Path $ExtractedMinecraft "mods") `
-                -Filter "*.jar" `
-                -File `
-                -ErrorAction SilentlyContinue
-            )
-
-            if ($ExtractedMods.Count -lt 10) {
-              Write-Warning "Minecraft mods are incomplete."
-              continue
-            }
-
-            # اطمینان از وجود فایل‌های دسکتاپ
-            $RestoreFiles = @(
-              Get-ChildItem -LiteralPath $RestoreRoot -Force
-            )
-
-            if ($RestoreFiles.Count -eq 0) {
-              Write-Warning "Desktop backup is empty."
-              continue
-            }
-
-            # اکنون بازیابی نهایی انجام می‌شود
-            New-Item -ItemType Directory -Force -Path $DesktopDir | Out-Null
-
-            Get-ChildItem -LiteralPath $DesktopDir -Force |
-              Remove-Item -Recurse -Force
-
-            Get-ChildItem -LiteralPath $RestoreRoot -Force |
-              Move-Item -Destination $DesktopDir
-
-            if (-not (Test-Path (Join-Path $DesktopDir "Minecraft\run.bat"))) {
-              throw "Final Minecraft restore verification failed."
-            }
-
-            Write-Host "=================================="
-            Write-Host "DESKTOP RESTORE SUCCESSFUL"
+            Write-Host "Backup restored successfully."
             Write-Host "Release: $Tag"
-            Write-Host "Minecraft root: $MinecraftRoot"
-            Write-Host "Mods: $($ExtractedMods.Count)"
-            Write-Host "=================================="
 
             $Restored = $true
             break
           }
 
           if (-not $Restored) {
-            throw "No valid desktop backup could be restored."
+            throw "Could not restore any backup."
           }
 
-      # ================================================
-      # 5. Prepare Minecraft
-      # ================================================
-
-      - name: Prepare Minecraft Server
+      # 7. آماده‌سازی فایل‌های Minecraft
+      - name: Prepare Minecraft
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $ServerDir = $env:SERVER_DIR
-
-          if (-not (Test-Path $ServerDir)) {
-            throw "Minecraft directory is missing."
+          if (-not (Test-Path $env:SERVER_DIR)) {
+            throw "Minecraft folder does not exist: $env:SERVER_DIR"
           }
 
-          if (-not (Test-Path (Join-Path $ServerDir "run.bat"))) {
-            throw "Forge run.bat is missing."
-          }
+          Set-Location $env:SERVER_DIR
 
-          $ModsDir = Join-Path $ServerDir "mods"
-
-          $Mods = @(
-            Get-ChildItem $ModsDir -Filter "*.jar" -File
-          )
-
-          if ($Mods.Count -lt 10) {
-            throw "Minecraft mods are incomplete."
-          }
-
-          $UserSid = (Get-LocalUser -Name $env:SERVER_USER).SID.Value
-
-          icacls $ServerDir /grant "*${UserSid}:(OI)(CI)F" /T /C
-          icacls $ServerDir /grant "Administrators:(OI)(CI)F" /T /C
-
-          Get-ChildItem $ServerDir -Recurse -Force -File |
-            ForEach-Object {
-              $_.IsReadOnly = $false
-            }
-
-          # حافظه Java
-          $JvmArgs = Join-Path $ServerDir "user_jvm_args.txt"
-
-          $Lines = @()
-
-          if (Test-Path $JvmArgs) {
-            $Lines = @(
-              Get-Content $JvmArgs |
-                Where-Object {
-                  $_ -notmatch '^\s*-Xms' -and
-                  $_ -notmatch '^\s*-Xmx'
-                }
-            )
-          }
-
-          $Lines += "-Xms2G"
-          $Lines += "-Xmx12G"
-
-          Set-Content -Path $JvmArgs -Value $Lines
-
-          # تنظیم RCON
-          $Properties = Join-Path $ServerDir "server.properties"
-
-          if (-not (Test-Path $Properties)) {
-            throw "server.properties is missing."
-          }
-
-          $RconPassword = -join (
-            1..32 | ForEach-Object {
-              '{0:x2}' -f (Get-Random -Minimum 0 -Maximum 256)
-            }
-          )
-
-          Set-Content `
-            -Path "$env:RUNNER_TEMP\rcon-password.txt" `
-            -Value $RconPassword
-
-          $Settings = @{
-            "enable-rcon" = "true"
-            "rcon.port" = "25575"
-            "rcon.password" = $RconPassword
-            "broadcast-rcon-to-ops" = "false"
-          }
-
-          $PropertyLines = @(
-            Get-Content $Properties |
-              Where-Object {
-                $_ -notmatch '^(enable-rcon|rcon\.port|rcon\.password|broadcast-rcon-to-ops)='
-              }
-          )
-
-          foreach ($Key in $Settings.Keys) {
-            $PropertyLines += "$Key=$($Settings[$Key])"
-          }
-
-          Set-Content -Path $Properties -Value $PropertyLines
+          # حذف علامت توقف باقی‌مانده از بکاپ قبلی
+          Remove-Item "$env:DESKTOP_DIR\STOP_SERVER.txt" `
+            -Force -ErrorAction SilentlyContinue
 
           # فایل اجرای سرور
-          @'
+          $StartBat = @'
           @echo off
           cd /d "%~dp0"
+          if not exist run.bat (
+              echo ERROR: run.bat not found.
+              pause
+              exit /b 1
+          )
           call run.bat nogui
-          pause
-          '@ | Set-Content `
-            -Path (Join-Path $ServerDir "START MINECRAFT SERVER.bat") `
+          '@
+
+          Set-Content `
+            -Path "$env:SERVER_DIR\START MINECRAFT SERVER.bat" `
+            -Value $StartBat `
             -Encoding ASCII
 
-          # فایل توقف سرور
-          @'
+          # فایل توقف سرور و درخواست بکاپ
+          $StopBat = @'
           @echo off
-          title Minecraft Server Shutdown
           echo STOP > "%USERPROFILE%\Desktop\STOP_SERVER.txt"
-          echo Shutdown request sent.
-          echo Wait for the GitHub workflow to finish the backup.
+          echo Stop request sent. The workflow will stop the server and create a backup.
           pause
-          '@ | Set-Content `
-            -Path (Join-Path $ServerDir "STOP SERVER + BACKUP.bat") `
+          '@
+
+          Set-Content `
+            -Path "$env:SERVER_DIR\STOP SERVER + BACKUP.bat" `
+            -Value $StopBat `
             -Encoding ASCII
 
-          Write-Host "Minecraft prepared."
-          Write-Host "Mods: $($Mods.Count)"
+          # دسترسی کامل کاربر
+          icacls $env:SERVER_DIR /grant "NvDAdmin:(OI)(CI)F" /T /C
 
-      # ================================================
-      # 6. Tailscale
-      # ================================================
+          Write-Host "Minecraft directory prepared."
+          Write-Host "Server directory: $env:SERVER_DIR"
 
-      - name: Install and Connect Tailscale
-        shell: pwsh
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
-            throw "TAILSCALE_AUTHKEY is missing."
-          }
-
-          $Msi = Join-Path $env:RUNNER_TEMP "tailscale.msi"
-
-          Invoke-WebRequest `
-            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
-            -OutFile $Msi
-
-          $Install = Start-Process `
-            -FilePath "msiexec.exe" `
-            -ArgumentList "/i `"$Msi`" /qn /norestart" `
-            -Wait `
-            -PassThru
-
-          if ($Install.ExitCode -notin @(0, 3010)) {
-            throw "Tailscale installation failed."
-          }
-
-          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          if (-not (Test-Path $Tailscale)) {
-            throw "Tailscale executable missing."
-          }
-
-          Start-Service Tailscale -ErrorAction SilentlyContinue
-
-          & $Tailscale up `
-            --authkey=$env:TAILSCALE_AUTHKEY `
-            --hostname=minecraft-runner `
-            --accept-routes
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale connection failed."
-          }
-
-          Start-Sleep -Seconds 10
-
-          & $Tailscale status
-          & $Tailscale ip -4
-
-      # ================================================
-      # 7. RDP Information
-      # ================================================
-
-      - name: Show RDP Details
+      # 8. نمایش اطلاعات RDP
+      - name: Show RDP Information
         shell: pwsh
         run: |
-          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          $IP = & $Tailscale ip -4
-
-          if ($LASTEXITCODE -ne 0 -or -not $IP) {
-            throw "Could not obtain Tailscale IP."
-          }
-
-          Write-Host ""
-          Write-Host "========== RDP =========="
-          Write-Host "IP: $IP"
-          Write-Host "Username: $env:SERVER_USER"
-          Write-Host "Password: GitHub Secret RDP_PASSWORD"
+          Write-Host "===================================="
+          Write-Host "RDP SERVER READY"
+          Write-Host "===================================="
+          Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Port: 3389"
-          Write-Host "========================="
+          Write-Host "Username: NvDAdmin"
+          Write-Host "Password: GitHub secret RDP_PASSWORD"
+          Write-Host "===================================="
 
-      # ================================================
-      # 8. Start Minecraft
-      # ================================================
-
-      - name: Start Minecraft Forge Server
-        id: minecraft
+      # 9. اجرای Minecraft و نگه داشتن رانر
+      - name: Start Minecraft and Keep Runner Alive
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $ServerDir = $env:SERVER_DIR
-          $Marker = Join-Path $env:DESKTOP_DIR "STOP_SERVER.txt"
+          Set-Location $env:SERVER_DIR
 
-          Remove-Item $Marker -Force -ErrorAction SilentlyContinue
+          $RunBat = Join-Path $env:SERVER_DIR "run.bat"
 
-          $Command = "cd /d `"$ServerDir`" && call run.bat nogui"
+          if (-not (Test-Path $RunBat)) {
+            throw "run.bat is missing. The workflow will not reinstall Forge automatically."
+          }
 
-          $Process = Start-Process `
-            -FilePath "$env:SystemRoot\System32\cmd.exe" `
-            -ArgumentList "/c", $Command `
-            -WorkingDirectory $ServerDir `
-            -PassThru `
-            -WindowStyle Hidden
+          $SafeStopFile = Join-Path $env:RUNNER_TEMP "minecraft-safe-stop.txt"
+          Remove-Item $SafeStopFile -Force -ErrorAction SilentlyContinue
 
-          $Process.Id |
-            Set-Content "$env:RUNNER_TEMP\minecraft-wrapper.pid"
+          $ProcessInfo = New-Object System.Diagnostics.ProcessStartInfo
+          $ProcessInfo.FileName = $env:ComSpec
+          $ProcessInfo.Arguments = '/c ""run.bat" nogui'
+          $ProcessInfo.WorkingDirectory = $env:SERVER_DIR
+          $ProcessInfo.UseShellExecute = $false
+          $ProcessInfo.RedirectStandardInput = $true
+          $ProcessInfo.RedirectStandardOutput = $true
+          $ProcessInfo.RedirectStandardError = $true
+          $ProcessInfo.CreateNoWindow = $true
 
-          Write-Host "Minecraft wrapper PID: $($Process.Id)"
+          $ServerProcess = New-Object System.Diagnostics.Process
+          $ServerProcess.StartInfo = $ProcessInfo
 
-          $Deadline = (Get-Date).AddMinutes(8)
-          $Started = $false
+          if (-not $ServerProcess.Start()) {
+            throw "Minecraft process could not start."
+          }
 
-          while ((Get-Date) -lt $Deadline) {
+          # خواندن خروجی به شکل غیرهمزمان برای جلوگیری از پر شدن بافر
+          $StdoutTask = $ServerProcess.StandardOutput.ReadToEndAsync()
+          $StderrTask = $ServerProcess.StandardError.ReadToEndAsync()
 
-            Start-Sleep -Seconds 10
+          Write-Host "Minecraft started. PID: $($ServerProcess.Id)"
 
-            $Java = @(
-              Get-CimInstance Win32_Process |
-                Where-Object {
-                  $_.Name -match '^javaw?\.exe$' -and
-                  $_.CommandLine -match '(?i)(forge|forgeserver|user_jvm_args|minecraft)'
-                }
-            )
+          $StopRequested = $false
+          $StartTime = Get-Date
 
-            if ($Java.Count -gt 0) {
-              $Started = $true
+          # حداکثر حدود ۵ ساعت و ۴۵ دقیقه برای سرور
+          while (-not $ServerProcess.HasExited) {
+
+            if (Test-Path "$env:DESKTOP_DIR\STOP_SERVER.txt") {
+              Write-Host "Stop marker detected."
+              $StopRequested = $true
               break
             }
 
-            if ($Process.HasExited) {
-              throw "Minecraft launcher exited before server startup."
-            }
-
-            if (Test-Path $Marker) {
-              throw "Stop marker appeared before Minecraft started."
-            }
-          }
-
-          if (-not $Started) {
-            throw "Minecraft did not start within 8 minutes."
-          }
-
-          Write-Host "Minecraft Java process detected."
-
-      # ================================================
-      # 9. Keep Server Running
-      # ================================================
-
-      - name: Keep Server Running
-        if: steps.minecraft.outcome == 'success'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $Marker = Join-Path $env:DESKTOP_DIR "STOP_SERVER.txt"
-          $Deadline = (Get-Date).AddMinutes(330)
-
-          while ((Get-Date) -lt $Deadline) {
-
-            if (Test-Path $Marker) {
-              Write-Host "Stop request received."
+            if (((Get-Date) - $StartTime).TotalMinutes -ge 345) {
+              Write-Host "Maximum runtime reached. Stopping server."
+              $StopRequested = $true
               break
             }
 
-            $Java = @(
-              Get-CimInstance Win32_Process |
-                Where-Object {
-                  $_.Name -match '^javaw?\.exe$' -and
-                  $_.CommandLine -match '(?i)(forge|forgeserver|user_jvm_args|minecraft)'
-                }
-            )
-
-            if ($Java.Count -eq 0) {
-              Write-Warning "Minecraft Java process stopped."
-              break
-            }
-
-            Start-Sleep -Seconds 15
+            Start-Sleep -Seconds 5
+            $ServerProcess.Refresh()
           }
 
-      # ================================================
-      # 10. Safe Shutdown
-      # ================================================
+          if ($StopRequested -and -not $ServerProcess.HasExited) {
 
-      - name: Stop Minecraft Safely
-        id: stop
+            Write-Host "Sending graceful stop command..."
+
+            try {
+              $ServerProcess.StandardInput.WriteLine("stop")
+              $ServerProcess.StandardInput.Flush()
+            }
+            catch {
+              Write-Warning "Could not send stop command."
+            }
+
+            if (-not $ServerProcess.WaitForExit(90000)) {
+              Write-Warning "Server did not stop within 90 seconds."
+              throw "Server is still running. Backup will be skipped to protect world data."
+            }
+          }
+
+          if ($ServerProcess.HasExited) {
+            Write-Host "Minecraft process exited."
+            "SAFE" | Out-File -FilePath $SafeStopFile -Encoding ASCII
+          }
+
+          if (-not $ServerProcess.HasExited) {
+            throw "Minecraft is still running."
+          }
+
+          Write-Host "Minecraft stopped safely."
+
+      # 10. بکاپ‌گیری از کل دسکتاپ
+      - name: Create Full Desktop Backup
         if: always()
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Continue"
-
-          $SafeToBackup = $false
-
-          function Get-MinecraftJava {
-            @(
-              Get-CimInstance Win32_Process |
-                Where-Object {
-                  $_.Name -match '^javaw?\.exe$' -and
-                  $_.CommandLine -match '(?i)(forge|forgeserver|user_jvm_args|minecraft)'
-                }
-            )
-          }
-
-          $Java = Get-MinecraftJava
-
-          if ($Java.Count -eq 0) {
-            Write-Host "No Minecraft Java process detected."
-            $SafeToBackup = $true
-          }
-          else {
-            try {
-              $PasswordFile = Join-Path $env:RUNNER_TEMP "rcon-password.txt"
-
-              if (-not (Test-Path $PasswordFile)) {
-                throw "RCON password file missing."
-              }
-
-              $Password = (Get-Content $PasswordFile -Raw).Trim()
-
-              function Read-Exact {
-                param(
-                  [System.IO.Stream]$Stream,
-                  [int]$Count
-                )
-
-                $Buffer = New-Object byte[] $Count
-                $Offset = 0
-
-                while ($Offset -lt $Count) {
-                  $Read = $Stream.Read($Buffer, $Offset, $Count - $Offset)
-
-                  if ($Read -le 0) {
-                    throw "RCON connection closed."
-                  }
-
-                  $Offset += $Read
-                }
-
-                return ,$Buffer
-              }
-
-              function Read-RconPacket {
-                param([System.IO.Stream]$Stream)
-
-                $LengthBytes = Read-Exact $Stream 4
-                $Length = [BitConverter]::ToInt32($LengthBytes, 0)
-
-                if ($Length -lt 10 -or $Length -gt 4096) {
-                  throw "Invalid RCON packet."
-                }
-
-                $Body = Read-Exact $Stream $Length
-
-                return @{
-                  Id = [BitConverter]::ToInt32($Body, 0)
-                  Type = [BitConverter]::ToInt32($Body, 4)
-                }
-              }
-
-              function Send-RconPacket {
-                param(
-                  [System.IO.Stream]$Stream,
-                  [int]$Id,
-                  [int]$Type,
-                  [string]$Payload
-                )
-
-                $PayloadBytes = [Text.Encoding]::UTF8.GetBytes($Payload)
-
-                $Body = New-Object System.Collections.Generic.List[byte]
-
-                $Body.AddRange([BitConverter]::GetBytes($Id))
-                $Body.AddRange([BitConverter]::GetBytes($Type))
-                $Body.AddRange($PayloadBytes)
-                $Body.Add(0)
-                $Body.Add(0)
-
-                $Length = [BitConverter]::GetBytes([int]$Body.Count)
-
-                $Stream.Write($Length, 0, 4)
-
-                $Bytes = $Body.ToArray()
-                $Stream.Write($Bytes, 0, $Bytes.Length)
-                $Stream.Flush()
-              }
-
-              $Client = New-Object System.Net.Sockets.TcpClient(
-                [System.Net.Sockets.AddressFamily]::InterNetwork
-              )
-
-              $Client.ReceiveTimeout = 5000
-              $Client.SendTimeout = 5000
-
-              $Client.Connect("127.0.0.1", 25575)
-
-              $Stream = $Client.GetStream()
-
-              Send-RconPacket $Stream 100 3 $Password
-
-              $Auth = Read-RconPacket $Stream
-
-              if ($Auth.Id -ne 100) {
-                throw "RCON authentication failed."
-              }
-
-              Send-RconPacket $Stream 101 2 "stop"
-
-              $Client.Close()
-
-              Write-Host "RCON stop command sent."
-            }
-            catch {
-              Write-Warning "RCON shutdown failed: $_"
-            }
-
-            $Deadline = (Get-Date).AddSeconds(180)
-
-            while ((Get-Date) -lt $Deadline) {
-
-              Start-Sleep -Seconds 5
-
-              $Java = Get-MinecraftJava
-
-              if ($Java.Count -eq 0) {
-                $SafeToBackup = $true
-                break
-              }
-            }
-
-            if (-not $SafeToBackup) {
-              Write-Warning "Minecraft is still running. Backup skipped."
-            }
-          }
-
-          Remove-Item `
-            (Join-Path $env:DESKTOP_DIR "STOP_SERVER.txt") `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          "safe_to_backup=$($SafeToBackup.ToString().ToLower())" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-      # ================================================
-      # 11. Full Desktop Backup
-      # ================================================
-
-      - name: Create Full Desktop Backup
-        id: backup
-        if: always() && steps.stop.outputs.safe_to_backup == 'true'
-        shell: pwsh
-        run: |
           $ErrorActionPreference = "Stop"
 
-          $DesktopDir = $env:DESKTOP_DIR
-          $BackupDir = Join-Path $env:RUNNER_TEMP "MinecraftDesktopBackup"
-          $Zip = Join-Path $env:RUNNER_TEMP "Minecraft-EmergencyBackup.zip"
-          $HashFile = Join-Path $env:RUNNER_TEMP "Minecraft-EmergencyBackup.sha256"
+          $SafeStopFile = Join-Path $env:RUNNER_TEMP "minecraft-safe-stop.txt"
 
-          if (-not (Test-Path $DesktopDir)) {
-            throw "Desktop directory missing."
+          if (-not (Test-Path $SafeStopFile)) {
+            Write-Warning "Safe server shutdown was not confirmed."
+            Write-Warning "Backup skipped to avoid saving an inconsistent world."
+            exit 0
           }
+
+          $BackupDir = Join-Path $env:RUNNER_TEMP "DesktopBackup"
+          $Zip = Join-Path $env:RUNNER_TEMP "Minecraft-EmergencyBackup.zip"
 
           Remove-Item $BackupDir -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item $Zip -Force -ErrorAction SilentlyContinue
-          Remove-Item $HashFile -Force -ErrorAction SilentlyContinue
 
           New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
 
-          robocopy $DesktopDir $BackupDir `
-            /E `
-            /COPY:DAT `
-            /DCOPY:DAT `
-            /R:2 `
-            /W:2 `
-            /XJ `
-            /SL
+          Write-Host "Backing up entire desktop..."
+
+          robocopy $env:DESKTOP_DIR $BackupDir `
+            /E /COPY:DAT /DCOPY:DAT /R:2 /W:2 /XJ /SL
 
           $CopyCode = $LASTEXITCODE
 
           if ($CopyCode -ge 8) {
-            throw "Robocopy failed: $CopyCode"
+            throw "Robocopy failed with exit code $CopyCode."
           }
 
-          $Files = @(
-            Get-ChildItem $BackupDir -Recurse -Force -File
-          )
-
-          $TotalSize = ($Files | Measure-Object Length -Sum).Sum
-
-          if ($Files.Count -lt 10 -or $TotalSize -lt 1MB) {
-            throw "Desktop backup is incomplete or too small."
-          }
-
-          $Mods = @(
-            Get-ChildItem `
-              (Join-Path $BackupDir "Minecraft\mods") `
-              -Filter "*.jar" `
-              -File `
-              -ErrorAction SilentlyContinue
-          )
-
-          if ($Mods.Count -lt 10) {
-            throw "Minecraft mods missing from backup."
-          }
+          Write-Host "Creating ZIP archive..."
 
           tar -a -c -f $Zip -C $BackupDir .
 
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Zip)) {
+          if ($LASTEXITCODE -ne 0) {
             throw "ZIP creation failed."
           }
 
-          $Entries = @(tar -tf $Zip)
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "ZIP verification failed."
+          if (-not (Test-Path $Zip)) {
+            throw "Backup ZIP was not created."
           }
 
-          $ArchiveMods = @(
-            $Entries | Where-Object {
-              $_.Replace('\','/') -match '(?i)(^|/)Minecraft/mods/.*\.jar$'
-            }
-          )
+          $Size = (Get-Item $Zip).Length
 
-          if ($ArchiveMods.Count -lt 10) {
-            throw "ZIP archive does not contain expected mods."
+          Write-Host "Backup size: $([math]::Round($Size / 1MB, 2)) MB"
+
+          if ($Size -lt 1MB) {
+            throw "Backup ZIP is too small."
           }
 
-          $Hash = (Get-FileHash $Zip -Algorithm SHA256).Hash
+          "BACKUP_ZIP=$Zip" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
 
-          Set-Content -Path $HashFile -Value $Hash
+          Write-Host "Desktop backup created successfully."
 
-          "backup_ready=true" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-          Write-Host "Backup completed."
-          Write-Host "Files: $($Files.Count)"
-          Write-Host "Size: $([math]::Round($TotalSize / 1MB, 2)) MB"
-          Write-Host "Mods: $($Mods.Count)"
-          Write-Host "SHA256: $Hash"
-
-      # ================================================
-      # 12. GitHub Release Upload
-      # ================================================
-
+      # 11. انتشار بکاپ در GitHub Releases
       - name: Upload Backup to GitHub Release
-        if: always() && steps.backup.outputs.backup_ready == 'true'
+        if: always()
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $Zip = Join-Path $env:RUNNER_TEMP "Minecraft-EmergencyBackup.zip"
-          $HashFile = Join-Path $env:RUNNER_TEMP "Minecraft-EmergencyBackup.sha256"
-
-          if (-not (Test-Path $Zip) -or -not (Test-Path $HashFile)) {
-            throw "Backup assets are missing."
+          if (-not $env:BACKUP_ZIP -or -not (Test-Path $env:BACKUP_ZIP)) {
+            Write-Warning "No backup ZIP available. Upload skipped."
+            exit 0
           }
 
           $Tag = "minecraft-backup-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
 
+          Write-Host "Creating release: $Tag"
+
           gh release create $Tag `
-            $Zip `
-            $HashFile `
+            $env:BACKUP_ZIP `
             --title "Minecraft Emergency Backup $env:GITHUB_RUN_ID" `
-            --notes "Full NvDAdmin Desktop backup. Minecraft Forge 1.20.1."
+            --notes "Automatic full desktop backup. No SHA256 file is used."
 
           if ($LASTEXITCODE -ne 0) {
             throw "GitHub Release upload failed."
           }
 
-          Write-Host "Release created: $Tag"
+          Write-Host "Backup uploaded successfully."
+          Write-Host "Release tag: $Tag"
 
-      # ================================================
-      # 13. Final Status
-      # ================================================
-
+      # 12. گزارش نهایی
       - name: Final Status
         if: always()
         shell: pwsh
         run: |
-          Write-Host ""
-          Write-Host "========== WORKFLOW STATUS =========="
-          Write-Host "Minecraft: ${{ steps.minecraft.outcome }}"
-          Write-Host "Stop: ${{ steps.stop.outcome }}"
-          Write-Host "Backup: ${{ steps.backup.outcome }}"
-          Write-Host "Safe to backup: ${{ steps.stop.outputs.safe_to_backup }}"
-          Write-Host "====================================="
+          Write-Host "===================================="
+          Write-Host "WORKFLOW FINISHED"
+          Write-Host "===================================="
+          Write-Host "RDP IP: $env:TAILSCALE_IP"
+          Write-Host "RDP Port: 3389"
+          Write-Host "Username: NvDAdmin"
+          Write-Host "Minecraft: $env:SERVER_DIR"
+          Write-Host "===================================="
