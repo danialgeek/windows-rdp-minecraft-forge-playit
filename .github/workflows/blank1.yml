@@ -687,13 +687,31 @@ jobs:
       # 6. INSTALL 3X-UI + XRAY AND START BORE TUNNELS
       # ================================================
 
-      - name: Install 3X-UI Windows, enable panel TLS, and start panel
+      -       - name: Install 3X-UI Windows, enable panel TLS, and start panel
         shell: pwsh
         env:
           RUNNER_TRACKING_ID: ""
+          XUI_USERNAME: ${{ secrets.XUI_USERNAME }}
+          XUI_PASSWORD: ${{ secrets.XUI_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
+
+          if ([string]::IsNullOrWhiteSpace($env:XUI_USERNAME)) {
+            throw "XUI_USERNAME secret is missing."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:XUI_PASSWORD)) {
+            throw "XUI_PASSWORD secret is missing."
+          }
+          if ($env:XUI_USERNAME.Length -lt 6) {
+            throw "XUI_USERNAME must contain at least 6 characters."
+          }
+          if ($env:XUI_PASSWORD.Length -lt 16) {
+            throw "XUI_PASSWORD must contain at least 16 characters."
+          }
+
+          Write-Host "::add-mask::$env:XUI_USERNAME"
+          Write-Host "::add-mask::$env:XUI_PASSWORD"
 
           $Api = "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest"
           $Headers = @{ "User-Agent" = "GitHub-Actions-3XUI-Setup" }
@@ -707,7 +725,7 @@ jobs:
             Select-Object -First 1
 
           if (!$PackageAsset -or !$HashAsset) {
-            throw "Latest stable 3X-UI release is missing the Windows package or its SHA256 asset."
+            throw "Latest 3X-UI release is missing its Windows package or SHA256 asset."
           }
 
           $PackageZip = Join-Path $env:RUNNER_TEMP "x-ui-windows-amd64.zip"
@@ -723,11 +741,14 @@ jobs:
           if ($HashText -notmatch '(?i)([a-f0-9]{64})') {
             throw "Could not read the 3X-UI SHA256 checksum."
           }
+
           $ExpectedHash = $Matches[1].ToUpperInvariant()
           $ActualHash = (Get-FileHash $PackageZip -Algorithm SHA256).Hash
+
           if ($ActualHash -ne $ExpectedHash) {
             throw "3X-UI package SHA256 validation failed."
           }
+
           Write-Host "3X-UI package SHA256 verified."
 
           Remove-Item $ExtractDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -736,16 +757,18 @@ jobs:
 
           $PanelExe = Get-ChildItem $ExtractDir -Recurse -Filter "3x-ui.exe" -File |
             Select-Object -First 1 -ExpandProperty FullName
+
           if ([string]::IsNullOrWhiteSpace($PanelExe) -or !(Test-Path $PanelExe)) {
-            throw "3x-ui.exe was not found in the official Windows package."
+            throw "3x-ui.exe was not found."
           }
 
           $PanelDir = Split-Path $PanelExe -Parent
           $XrayExe = Get-ChildItem $PanelDir -Recurse -File |
             Where-Object { $_.Name -match '^xray(-windows-amd64)?\.exe$' } |
             Select-Object -First 1
+
           if (!$XrayExe) {
-            throw "The official 3X-UI package does not contain the Windows Xray executable."
+            throw "Xray executable was not found."
           }
 
           $BinDir = Split-Path $XrayExe.FullName -Parent
@@ -753,22 +776,21 @@ jobs:
           $LogDir = Join-Path $PanelDir "logs"
           New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
-          # Create a self-signed TLS certificate for the public Bore hostname.
-          # The panel will not be published until the default admin password is changed.
-          $CertExpiry = (Get-Date).AddDays(180)
           $Cert = New-SelfSignedCertificate `
             -DnsName "bore.pub" `
             -CertStoreLocation "Cert:\CurrentUser\My" `
             -KeyAlgorithm RSA `
             -KeyLength 2048 `
             -KeyExportPolicy Exportable `
-            -NotAfter $CertExpiry
+            -NotAfter (Get-Date).AddDays(180)
 
           $CertObject = Get-Item "Cert:\CurrentUser\My\$($Cert.Thumbprint)"
           $CertPemPath = Join-Path $PanelDir "panel-bore-pub-cert.pem"
           $KeyPemPath = Join-Path $PanelDir "panel-bore-pub-key.pem"
+
           $CertPem = $CertObject.ExportCertificatePem()
           $RsaKey = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($CertObject)
+
           try {
             $PrivateKeyPem = $RsaKey.ExportPkcs8PrivateKeyPem()
           }
@@ -778,11 +800,11 @@ jobs:
 
           [System.IO.File]::WriteAllText($CertPemPath, $CertPem, [System.Text.UTF8Encoding]::new($false))
           [System.IO.File]::WriteAllText($KeyPemPath, $PrivateKeyPem, [System.Text.UTF8Encoding]::new($false))
+
           $CertFingerprint = $CertObject.GetCertHashString([System.Security.Cryptography.HashAlgorithmName]::SHA256)
           $PublicCertArtifact = Join-Path $env:RUNNER_TEMP "3x-ui-panel-public-cert.pem"
           Copy-Item $CertPemPath $PublicCertArtifact -Force
 
-          # Use an unguessable panel base path and keep the database next to the executable.
           $PathBytes = New-Object byte[] 20
           [System.Security.Cryptography.RandomNumberGenerator]::Fill($PathBytes)
           $PanelBasePath = "/" + [Convert]::ToHexString($PathBytes).ToLowerInvariant() + "/"
@@ -798,7 +820,6 @@ jobs:
           Add-Content $env:GITHUB_ENV "PANEL_CERT_PATH=$CertPemPath"
           Add-Content $env:GITHUB_ENV "PANEL_CERT_SHA256=$CertFingerprint"
 
-          # First launch creates the SQLite database and initial admin account.
           $PanelProcess = Start-Process -FilePath $PanelExe `
             -WorkingDirectory $PanelDir `
             -PassThru `
@@ -807,55 +828,101 @@ jobs:
 
           $DbPath = Join-Path $DbDir "x-ui.db"
           $Deadline = (Get-Date).AddMinutes(2)
+
           while ((Get-Date) -lt $Deadline -and !(Test-Path $DbPath)) {
             if ($PanelProcess.HasExited) {
-              Get-Content $PanelLog,$PanelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-              throw "3X-UI exited before creating its SQLite database."
+              Get-Content $PanelLog,$PanelErr -ErrorAction SilentlyContinue |
+                ForEach-Object { Write-Host $_ }
+              throw "3X-UI exited before creating its database."
             }
             Start-Sleep -Seconds 2
           }
+
           if (!(Test-Path $DbPath)) {
-            throw "3X-UI database was not created at $DbPath."
+            throw "3X-UI database was not created."
           }
 
           Stop-Process -Id $PanelProcess.Id -Force
           Start-Sleep -Seconds 2
 
-          # Set TLS and loopback-only panel binding directly in SQLite.
           $DbScript = Join-Path $env:RUNNER_TEMP "configure_3xui_db.py"
+
           @'
           import sqlite3, sys
+
           db_path, cert_path, key_path, base_path = sys.argv[1:5]
           con = sqlite3.connect(db_path)
+
           try:
-              tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+              tables = {
+                  row[0] for row in
+                  con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+              }
+
               if "settings" not in tables:
                   raise RuntimeError("3X-UI settings table was not found")
+
               values = {
                   "webCertFile": cert_path,
                   "webKeyFile": key_path,
                   "webBasePath": base_path,
                   "webListen": "127.0.0.1",
               }
+
               with con:
                   for key, value in values.items():
-                      con.execute("INSERT OR REPLACE INTO settings (`key`, `value`) VALUES (?, ?)", (key, value))
+                      con.execute(
+                          "INSERT OR REPLACE INTO settings (`key`, `value`) VALUES (?, ?)",
+                          (key, value)
+                      )
           finally:
               con.close()
-          print("3X-UI HTTPS, random base path, and loopback binding configured.")
+
+          print("3X-UI HTTPS settings configured.")
           '@ | Set-Content -Path $DbScript -Encoding UTF8
 
           python $DbScript $DbPath $CertPemPath $KeyPemPath $PanelBasePath
+
           if ($LASTEXITCODE -ne 0) {
-            throw "Could not configure 3X-UI TLS settings in SQLite."
+            throw "Could not configure 3X-UI TLS settings."
           }
+
+          # Configure the administrator account through the official 3X-UI CLI.
+          Write-Host "Configuring 3X-UI administrator credentials..."
+
+          Push-Location $PanelDir
+          try {
+            $CredentialOutput = & $PanelExe setting `
+              "-username=$($env:XUI_USERNAME)" `
+              "-password=$($env:XUI_PASSWORD)" `
+              "-resetTwoFactor" 2>&1 | Out-String
+
+            $CliCode = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+          }
+          finally {
+            Pop-Location
+          }
+
+          if ($CliCode -ne 0) {
+            Write-Host $CredentialOutput
+            throw "3X-UI credential command failed."
+          }
+
+          if ($CredentialOutput -notmatch "Username and password updated successfully") {
+            Write-Host $CredentialOutput
+            throw "3X-UI did not confirm the administrator credential update."
+          }
+
+          if ($CredentialOutput -notmatch "Two-factor authentication reset successfully") {
+            Write-Host $CredentialOutput
+            throw "3X-UI did not confirm the two-factor authentication reset."
+          }
+
+          Write-Host "3X-UI administrator credentials configured successfully."
 
           Remove-Item $PanelLog,$PanelErr -Force -ErrorAction SilentlyContinue
 
-          # Start 3X-UI through Task Scheduler under SYSTEM. A process launched
-          # directly by a GitHub Actions step can be terminated by the runner's
-          # per-step process cleanup when that step ends. A scheduled task gives
-          # the panel an independent lifetime across workflow steps.
           $TaskName = "GitHubActions-3XUI-Panel"
           Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
@@ -864,9 +931,8 @@ jobs:
             return "'" + $Value.Replace("'", "''") + "'"
           }
 
-          # Task Scheduler starts with a clean SYSTEM environment, so explicitly
-          # recreate the X-UI paths and base-path variables in a small launcher.
           $LauncherScript = Join-Path $env:RUNNER_TEMP "start-3xui-panel.ps1"
+
           $LauncherContent = @"
           `$ErrorActionPreference = 'Stop'
           `$env:XUI_DB_FOLDER = $(ConvertTo-PowerShellLiteral $DbDir)
@@ -876,16 +942,19 @@ jobs:
           Set-Location -LiteralPath $(ConvertTo-PowerShellLiteral $PanelDir)
           & $(ConvertTo-PowerShellLiteral $PanelExe) *> $(ConvertTo-PowerShellLiteral $PanelLog)
           "@
+
           Set-Content -Path $LauncherScript -Value $LauncherContent -Encoding UTF8
 
           $TaskAction = New-ScheduledTaskAction `
             -Execute (Join-Path $PSHOME "pwsh.exe") `
             -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$LauncherScript`"" `
             -WorkingDirectory $PanelDir
+
           $TaskPrincipal = New-ScheduledTaskPrincipal `
             -UserId "SYSTEM" `
             -LogonType ServiceAccount `
             -RunLevel Highest
+
           $TaskSettings = New-ScheduledTaskSettingsSet `
             -ExecutionTimeLimit ([TimeSpan]::Zero) `
             -StartWhenAvailable `
@@ -898,16 +967,19 @@ jobs:
             -Principal $TaskPrincipal `
             -Settings $TaskSettings `
             -Force | Out-Null
+
           Start-ScheduledTask -TaskName $TaskName
 
           $Deadline = (Get-Date).AddMinutes(2)
           $PanelReady = $false
+
           while ((Get-Date) -lt $Deadline) {
             try {
               $Response = Invoke-WebRequest `
                 -Uri "https://127.0.0.1:2053$PanelBasePath" `
                 -SkipCertificateCheck `
                 -TimeoutSec 5
+
               if ($Response.StatusCode -ge 200 -and $Response.StatusCode -lt 500) {
                 $PanelReady = $true
                 break
@@ -919,158 +991,32 @@ jobs:
           }
 
           if (!$PanelReady) {
-            Write-Host "--- Scheduled task state ---"
             Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue |
               Get-ScheduledTaskInfo | Format-List * | Out-String | Write-Host
-            Write-Host "--- 3X-UI process snapshot ---"
-            Get-Process -Name "3x-ui","x-ui" -ErrorAction SilentlyContinue |
-              Select-Object Id,ProcessName,StartTime,CPU,Responding |
-              Format-Table -AutoSize | Out-String | Write-Host
-            Get-Content $PanelLog,$PanelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-            throw "3X-UI did not serve HTTPS on 127.0.0.1:2053 within two minutes after scheduled-task launch."
+
+            Get-Content $PanelLog,$PanelErr -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host $_ }
+
+            throw "3X-UI did not start successfully."
           }
 
           $LocalPanelUrl = "https://127.0.0.1:2053$PanelBasePath"
+
           $Info = @(
             "3X-UI local panel: $LocalPanelUrl"
-            "Initial login: admin / admin"
-            "Change the default username and password before public exposure."
+            "Username: $env:XUI_USERNAME"
+            "Password: Stored in GitHub Actions secret XUI_PASSWORD"
+            "Two-factor authentication: Reset during startup"
             "Public panel TLS certificate SHA256: $CertFingerprint"
           )
+
           $Info | Set-Content -Path (Join-Path $env:DESKTOP_DIR "3X-UI-ACCESS-INFO.txt") -Encoding UTF8
 
           Write-Host "3X-UI Windows release: $($Release.tag_name)"
           Write-Host "3X-UI HTTPS is active on loopback only."
           Write-Host "LOCAL PANEL URL: $LocalPanelUrl"
-          Write-Host "INITIAL LOGIN: admin / admin"
-          Write-Host "CHANGE THE DEFAULT LOGIN BEFORE CREATING ENABLE_3XUI_PUBLIC.txt."
+          Write-Host "Use GitHub Secrets XUI_USERNAME and XUI_PASSWORD to log in."
           Write-Host "Self-signed certificate SHA256: $CertFingerprint"
-
-      - name: Start Bore RDP and VLESS REALITY tunnels
-        shell: pwsh
-        env:
-          RUNNER_TRACKING_ID: ""
-        run: |
-          $ErrorActionPreference = "Stop"
-          $Bore = $env:BORE_EXE
-          if (!(Test-Path $Bore)) {
-            throw "Bore executable is missing."
-          }
-
-          function Start-BoreTunnel {
-            param(
-              [string]$Name,
-              [int]$LocalPort,
-              [string[]]$ExtraArgs = @()
-            )
-
-            $OutLog = Join-Path $env:RUNNER_TEMP "$Name-bore-out.log"
-            $ErrLog = Join-Path $env:RUNNER_TEMP "$Name-bore-err.log"
-            $Launcher = Join-Path $env:RUNNER_TEMP "$Name-bore-launch.cmd"
-            Remove-Item $OutLog,$ErrLog,$Launcher -Force -ErrorAction SilentlyContinue
-
-            $BoreArgs = @("local", [string]$LocalPort, "--local-host", "127.0.0.1", "--to", "bore.pub") + $ExtraArgs
-            $ArgumentText = ($BoreArgs | ForEach-Object { [string]$_ }) -join ' '
-            $CommandLine = '"' + $Bore + '" ' + $ArgumentText + ' 1> "' + $OutLog + '" 2> "' + $ErrLog + '"'
-            Set-Content -Path $Launcher -Value "@echo off`r`n$CommandLine`r`n" -Encoding ASCII
-
-            # Run Bore as a SYSTEM scheduled task. A normal Start-Process child can
-            # be reaped when a GitHub Actions step ends, even if it reported a port.
-            $TaskName = "GitHubBore-$Name-$env:GITHUB_RUN_ID"
-            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-            $Action = New-ScheduledTaskAction `
-              -Execute "$env:SystemRoot\System32\cmd.exe" `
-              -Argument "/d /c `"$Launcher`"" `
-              -WorkingDirectory (Split-Path $Bore -Parent)
-            $Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
-            $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-            $Settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable
-            Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force | Out-Null
-            Start-ScheduledTask -TaskName $TaskName
-
-            $Deadline = (Get-Date).AddSeconds(60)
-            $PublicPort = $null
-            while ((Get-Date) -lt $Deadline) {
-              $Combined = ((Get-Content $OutLog,$ErrLog -ErrorAction SilentlyContinue) -join "`n")
-              if ($Combined -match 'listening at bore\.pub:(\d+)') {
-                $PublicPort = [int]$Matches[1]
-                break
-              }
-
-              $Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-              if ($Task -and $Task.State -ne 'Running' -and ((Get-Content $OutLog,$ErrLog -ErrorAction SilentlyContinue | Measure-Object -Line).Lines -gt 0)) {
-                Get-Content $OutLog,$ErrLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-                throw "Bore tunnel $Name scheduled task exited before publishing a port."
-              }
-              Start-Sleep -Seconds 2
-            }
-
-            if (!$PublicPort) {
-              Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-              Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-              Get-Content $OutLog,$ErrLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-              throw "Bore tunnel $Name did not report a public port."
-            }
-
-            $TaskEnvName = "$($Name.ToUpperInvariant())_TASK"
-            Add-Content $env:GITHUB_ENV "$TaskEnvName=$TaskName"
-            Add-Content $env:GITHUB_ENV "$($Name.ToUpperInvariant())_PORT=$PublicPort"
-            Write-Host "$Name PUBLIC ADDRESS: bore.pub:$PublicPort"
-            Write-Host "$Name Bore task: $TaskName"
-            return $PublicPort
-          }
-
-          $RdpCheck = Test-NetConnection 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
-          if (!$RdpCheck.TcpTestSucceeded) {
-            throw "Local RDP TCP 3389 is not reachable. Bore cannot expose a service that is not listening."
-          }
-
-          $RdpPort = Start-BoreTunnel -Name "BORE_RDP" -LocalPort 3389
-
-          # Reserve the same remote and local port for Xray so the VLESS link
-          # does not need a port rewrite. Try several high ports if one is busy.
-          $VlessPort = $null
-          foreach ($Candidate in @(35443,36443,37443,38443,39443,40443,41443,42443)) {
-            try {
-              Write-Host "Trying Bore/Xray port $Candidate..."
-              $VlessPort = Start-BoreTunnel `
-                -Name "BORE_VLESS" `
-                -LocalPort $Candidate `
-                -ExtraArgs @("--port", [string]$Candidate)
-              if ($VlessPort -eq $Candidate) {
-                break
-              }
-              $VlessPort = $null
-            }
-            catch {
-              Write-Warning "Bore port $Candidate is unavailable: $($_.Exception.Message)"
-              $VlessPort = $null
-            }
-          }
-
-          if (!$VlessPort) {
-            throw "Could not reserve any VLESS port on bore.pub from the configured candidate list."
-          }
-
-          Add-Content $env:GITHUB_ENV "VLESS_LOCAL_PORT=$VlessPort"
-
-          Write-Host ""
-          Write-Host "=========================================="
-          Write-Host "PUBLIC RDP: bore.pub:$RdpPort"
-          Write-Host "VLESS REALITY PUBLIC ENDPOINT: bore.pub:$VlessPort"
-          Write-Host "VLESS LOCAL INBOUND PORT MUST BE: $VlessPort"
-          Write-Host "PANEL IS HTTPS + LOOPBACK ONLY UNTIL YOU CHANGE admin/admin AND CREATE ENABLE_3XUI_PUBLIC.txt."
-          Write-Host "=========================================="
-
-      - name: Upload public 3X-UI TLS certificate
-        uses: actions/upload-artifact@v4
-        with:
-          name: 3xui-panel-public-certificate-${{ github.run_id }}
-          path: ${{ runner.temp }}/3x-ui-panel-public-cert.pem
-          if-no-files-found: error
-          retention-days: 1
-
       # ================================================
       # 7. KEEP SERVICES ALIVE AND ENABLE PANEL TUNNEL AFTER PASSWORD CHANGE
       # ================================================
