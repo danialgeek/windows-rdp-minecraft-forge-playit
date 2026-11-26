@@ -24,9 +24,9 @@ jobs:
 
     steps:
 
-      # --------------------------------------------------
-      # 1. Install Java 17
-      # --------------------------------------------------
+      # ================================================
+      # 1. INSTALL JAVA 17
+      # ================================================
 
       - name: Install Java 17
         uses: actions/setup-java@v4
@@ -34,37 +34,9 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Configure Java for RDP user
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          [Environment]::SetEnvironmentVariable(
-            "JAVA_HOME",
-            $env:JAVA_HOME,
-            "Machine"
-          )
-
-          $MachinePath = [Environment]::GetEnvironmentVariable(
-            "Path",
-            "Machine"
-          )
-
-          $JavaBin = "$env:JAVA_HOME\bin"
-
-          if ($MachinePath -notlike "*$JavaBin*") {
-            [Environment]::SetEnvironmentVariable(
-              "Path",
-              "$MachinePath;$JavaBin",
-              "Machine"
-            )
-          }
-
-          Write-Host "JAVA_HOME: $env:JAVA_HOME"
-
-      # --------------------------------------------------
-      # 2. Create RDP user
-      # --------------------------------------------------
+      # ================================================
+      # 2. CONFIGURE RDP USER
+      # ================================================
 
       - name: Configure Windows RDP
         shell: pwsh
@@ -77,11 +49,9 @@ jobs:
             throw "RDP_PASSWORD secret is missing."
           }
 
-          $Password = ConvertTo-SecureString `
-            $env:RDP_PASSWORD -AsPlainText -Force
+          $Password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
 
-          $User = Get-LocalUser -Name "NvDAdmin" `
-            -ErrorAction SilentlyContinue
+          $User = Get-LocalUser -Name "NvDAdmin" -ErrorAction SilentlyContinue
 
           if ($null -eq $User) {
             New-LocalUser `
@@ -91,22 +61,17 @@ jobs:
               -AccountNeverExpires
           }
           else {
-            Set-LocalUser `
-              -Name "NvDAdmin" `
-              -Password $Password
+            Set-LocalUser -Name "NvDAdmin" -Password $Password
           }
 
           Enable-LocalUser -Name "NvDAdmin"
 
-          Add-LocalGroupMember `
-            -Group "Administrators" `
-            -Member "NvDAdmin" `
-            -ErrorAction SilentlyContinue
-
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member "NvDAdmin" `
-            -ErrorAction SilentlyContinue
+          foreach ($Group in @("Administrators", "Remote Desktop Users")) {
+            Add-LocalGroupMember `
+              -Group $Group `
+              -Member "NvDAdmin" `
+              -ErrorAction SilentlyContinue
+          }
 
           Set-ItemProperty `
             -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
@@ -115,30 +80,29 @@ jobs:
 
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-          $Credential = [PSCredential]::new(
-            ".\NvDAdmin",
-            $Password
-          )
+          $Credential = [PSCredential]::new(".\NvDAdmin", $Password)
 
-          Start-Process `
+          $ProfileProcess = Start-Process `
             -FilePath "$PSHOME\pwsh.exe" `
             -Credential $Credential `
             -LoadUserProfile `
             -ArgumentList '-NoProfile -Command "exit"' `
             -Wait `
+            -PassThru `
             -WindowStyle Hidden
 
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $env:DESKTOP_DIR | Out-Null
+          if ($ProfileProcess.ExitCode -ne 0) {
+            throw "Could not initialize NvDAdmin user profile."
+          }
+
+          New-Item -ItemType Directory -Force -Path $env:DESKTOP_DIR | Out-Null
 
           Write-Host "RDP user configured."
           Write-Host "Desktop: $env:DESKTOP_DIR"
 
-      # --------------------------------------------------
-      # 3. Install and connect Tailscale
-      # --------------------------------------------------
+      # ================================================
+      # 3. INSTALL TAILSCALE
+      # ================================================
 
       - name: Install and connect Tailscale
         shell: pwsh
@@ -174,7 +138,7 @@ jobs:
           & $Tailscale up `
             "--authkey=$env:TAILSCALE_AUTHKEY" `
             "--hostname=minecraft-$env:GITHUB_RUN_ID" `
-            --accept-routes
+            "--accept-routes"
 
           if ($LASTEXITCODE -ne 0) {
             throw "Tailscale connection failed."
@@ -183,14 +147,14 @@ jobs:
           $IP = & $Tailscale ip -4
 
           Write-Host ""
-          Write-Host "================================"
-          Write-Host "RDP ADDRESS: $IP"
+          Write-Host "===================================="
+          Write-Host "RDP IP: $IP"
           Write-Host "USERNAME: NvDAdmin"
-          Write-Host "================================"
+          Write-Host "===================================="
 
-      # --------------------------------------------------
-      # 4. Restore latest Minecraft backup
-      # --------------------------------------------------
+      # ================================================
+      # 4. RESTORE LATEST BACKUP
+      # ================================================
 
       - name: Restore latest Minecraft backup
         shell: pwsh
@@ -198,17 +162,24 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
 
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $env:DESKTOP_DIR | Out-Null
+          $Repository = $env:GITHUB_REPOSITORY
+
+          if ([string]::IsNullOrWhiteSpace($Repository)) {
+            throw "GITHUB_REPOSITORY is missing."
+          }
+
+          New-Item -ItemType Directory -Force -Path $env:DESKTOP_DIR | Out-Null
 
           $DownloadDir = "$env:RUNNER_TEMP\MinecraftRestore"
           $ExtractDir = "$env:RUNNER_TEMP\MinecraftExtract"
 
           New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
 
+          Write-Host "Repository: $Repository"
+          Write-Host "Searching for Minecraft backups..."
+
           $Releases = gh release list `
+            --repo $Repository `
             --limit 100 `
             --json tagName,isDraft,isPrerelease,createdAt
 
@@ -228,8 +199,8 @@ jobs:
           )
 
           if ($Candidates.Count -eq 0) {
-            Write-Warning "No previous Minecraft backup was found."
-            Write-Host "Starting with the existing desktop."
+            Write-Warning "No previous backup found."
+            Write-Host "Existing desktop will be preserved."
           }
           else {
             $Restored = $false
@@ -237,14 +208,14 @@ jobs:
             foreach ($Release in $Candidates) {
               $Tag = $Release.tagName
 
+              Write-Host ""
               Write-Host "Checking backup: $Tag"
 
-              Remove-Item $DownloadDir -Recurse -Force `
-                -ErrorAction SilentlyContinue
-
+              Remove-Item $DownloadDir -Recurse -Force -ErrorAction SilentlyContinue
               New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
 
-              & gh release download $Tag `
+              gh release download $Tag `
+                --repo $Repository `
                 --pattern "Minecraft-EmergencyBackup.zip" `
                 --dir $DownloadDir
 
@@ -258,11 +229,12 @@ jobs:
               $Zip = Join-Path $DownloadDir "Minecraft-EmergencyBackup.zip"
 
               if (!(Test-Path $Zip)) {
-                Write-Warning "ZIP file is missing. Trying another release."
+                Write-Warning "ZIP asset is missing."
                 continue
               }
 
-              & gh release download $Tag `
+              gh release download $Tag `
+                --repo $Repository `
                 --pattern "Minecraft-EmergencyBackup.sha256" `
                 --dir $DownloadDir
 
@@ -287,22 +259,20 @@ jobs:
                 Write-Host "SHA256 verification successful."
               }
               else {
-                Write-Warning "This release has no SHA256 file. Continuing without hash verification."
+                Write-Warning "SHA256 asset is missing. Continuing without hash verification."
               }
 
-              Remove-Item $ExtractDir -Recurse -Force `
-                -ErrorAction SilentlyContinue
-
+              Remove-Item $ExtractDir -Recurse -Force -ErrorAction SilentlyContinue
               New-Item -ItemType Directory -Force -Path $ExtractDir | Out-Null
 
-              & tar.exe -xf $Zip -C $ExtractDir
+              tar.exe -xf $Zip -C $ExtractDir
 
               if ($LASTEXITCODE -ne 0) {
-                Write-Warning "ZIP extraction failed. Trying another release."
+                Write-Warning "Extraction failed. Trying another release."
                 continue
               }
 
-              & robocopy $ExtractDir $env:DESKTOP_DIR `
+              robocopy $ExtractDir $env:DESKTOP_DIR `
                 /E /COPY:DAT /DCOPY:DAT /R:2 /W:2 /XJ /SL
 
               $CopyCode = $LASTEXITCODE
@@ -310,11 +280,12 @@ jobs:
               Write-Host "Robocopy exit code: $CopyCode"
 
               if ($CopyCode -ge 8) {
-                Write-Warning "Restore copy failed. Trying another release."
+                Write-Warning "Restore failed. Trying another release."
                 continue
               }
 
               Write-Host "Restore successful: $Tag"
+
               $Restored = $true
               break
             }
@@ -324,9 +295,9 @@ jobs:
             }
           }
 
-      # --------------------------------------------------
-      # 5. Configure RCON and manual server launcher
-      # --------------------------------------------------
+      # ================================================
+      # 5. CONFIGURE RCON AND SERVER LAUNCHER
+      # ================================================
 
       - name: Configure Minecraft RCON
         shell: pwsh
@@ -340,13 +311,10 @@ jobs:
           }
 
           if ($env:RCON_PASSWORD -match '[\r\n\s]') {
-            throw "RCON_PASSWORD must not contain spaces or newlines."
+            throw "RCON_PASSWORD must not contain whitespace."
           }
 
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $env:SERVER_DIR | Out-Null
+          New-Item -ItemType Directory -Force -Path $env:SERVER_DIR | Out-Null
 
           $Properties = Join-Path $env:SERVER_DIR "server.properties"
 
@@ -398,7 +366,6 @@ jobs:
               call run-server.bat
           ) else (
               echo Minecraft Forge run.bat was not found.
-              echo Check the Minecraft folder.
               pause
           )
 
@@ -407,17 +374,14 @@ jobs:
 
           $LauncherPath = Join-Path $env:DESKTOP_DIR "START MINECRAFT SERVER.bat"
 
-          Set-Content `
-            -Path $LauncherPath `
-            -Value $Launcher `
-            -Encoding ASCII
+          Set-Content -Path $LauncherPath -Value $Launcher -Encoding ASCII
 
           Write-Host "RCON configured."
-          Write-Host "Manual launcher created on the desktop."
+          Write-Host "Server launcher created."
 
-      # --------------------------------------------------
-      # 6. Keep runner alive
-      # --------------------------------------------------
+      # ================================================
+      # 6. KEEP RUNNER ALIVE
+      # ================================================
 
       - name: Keep RDP runner alive
         shell: pwsh
@@ -425,18 +389,18 @@ jobs:
           Write-Host "======================================"
           Write-Host "RDP is ready."
           Write-Host "Start Minecraft manually from the desktop."
-          Write-Host "To stop and back up, press Cancel workflow."
+          Write-Host "Press Cancel workflow to stop and backup."
           Write-Host "======================================"
 
           while ($true) {
             Start-Sleep -Seconds 15
           }
 
-      # --------------------------------------------------
-      # 7. On cancellation: stop, backup, upload, shutdown
-      # --------------------------------------------------
+      # ================================================
+      # 7. STOP SERVER + BACKUP + RELEASE + SHUTDOWN
+      # ================================================
 
-      - name: Stop Minecraft, backup desktop and shutdown
+      - name: Stop Minecraft and create emergency backup
         if: always()
         shell: pwsh
         env:
@@ -445,9 +409,9 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
 
-          # ----------------------------------------------
-          # RCON helper functions
-          # ----------------------------------------------
+          # --------------------------------------------
+          # RCON FUNCTIONS
+          # --------------------------------------------
 
           function Read-ExactBytes {
             param(
@@ -459,11 +423,7 @@ jobs:
             $Offset = 0
 
             while ($Offset -lt $Count) {
-              $Read = $Stream.Read(
-                $Buffer,
-                $Offset,
-                $Count - $Offset
-              )
+              $Read = $Stream.Read($Buffer, $Offset, $Count - $Offset)
 
               if ($Read -le 0) {
                 throw "RCON connection closed unexpectedly."
@@ -532,12 +492,7 @@ jobs:
             $Client = [System.Net.Sockets.TcpClient]::new()
 
             try {
-              $Async = $Client.BeginConnect(
-                "127.0.0.1",
-                25575,
-                $null,
-                $null
-              )
+              $Async = $Client.BeginConnect("127.0.0.1", 25575, $null, $null)
 
               if (!$Async.AsyncWaitHandle.WaitOne(1000)) {
                 return $false
@@ -554,9 +509,9 @@ jobs:
             }
           }
 
-          # ----------------------------------------------
-          # Stop server safely
-          # ----------------------------------------------
+          # --------------------------------------------
+          # STOP MINECRAFT
+          # --------------------------------------------
 
           Write-Host "Checking Minecraft server..."
 
@@ -564,17 +519,13 @@ jobs:
 
           if (!$PortOpen) {
             $JavaProcesses = @(
-              Get-Process -Name java,javaw `
-                -ErrorAction SilentlyContinue
+              Get-Process -Name java,javaw -ErrorAction SilentlyContinue
             )
 
             if ($JavaProcesses.Count -gt 0) {
               $Deadline = (Get-Date).AddSeconds(60)
 
-              while (
-                !(Test-RconPort) -and
-                (Get-Date) -lt $Deadline
-              ) {
+              while (!(Test-RconPort) -and (Get-Date) -lt $Deadline) {
                 Start-Sleep -Seconds 2
               }
 
@@ -583,14 +534,16 @@ jobs:
           }
 
           if ($PortOpen) {
-            Write-Host "Minecraft RCON detected. Sending stop..."
+            Write-Host "RCON detected. Sending stop command..."
 
             $Client = [System.Net.Sockets.TcpClient]::new()
             $Client.ReceiveTimeout = 10000
             $Client.SendTimeout = 10000
+            $Stream = $null
 
             try {
               $Client.Connect("127.0.0.1", 25575)
+
               $Stream = $Client.GetStream()
               $Stream.ReadTimeout = 10000
               $Stream.WriteTimeout = 10000
@@ -611,7 +564,8 @@ jobs:
 
               $Response = Read-RconPacket $Stream
 
-              Write-Host "RCON response: $($Response.Body)"
+              Write-Host "RCON stop command sent."
+              Write-Host "Response: $($Response.Body)"
             }
             finally {
               if ($Stream) {
@@ -621,7 +575,7 @@ jobs:
               $Client.Close()
             }
 
-            Write-Host "Waiting for Minecraft to stop..."
+            Write-Host "Waiting for Minecraft shutdown..."
 
             $Deadline = (Get-Date).AddSeconds(120)
 
@@ -630,40 +584,34 @@ jobs:
             }
 
             if (Test-RconPort) {
-              throw "Minecraft did not stop. Backup aborted to protect world data."
+              throw "Minecraft did not stop. Backup aborted."
             }
 
-            Write-Host "Minecraft stopped successfully."
+            Write-Host "Minecraft stopped."
           }
           else {
             $JavaProcesses = @(
-              Get-Process -Name java,javaw `
-                -ErrorAction SilentlyContinue
+              Get-Process -Name java,javaw -ErrorAction SilentlyContinue
             )
 
             if ($JavaProcesses.Count -gt 0) {
-              throw "Java is running but RCON is unavailable. Backup aborted to protect server data."
+              throw "Java is running but RCON is unavailable. Backup aborted."
             }
 
-            Write-Host "No running Java server detected."
+            Write-Host "No Java process detected."
           }
 
-          # ----------------------------------------------
-          # Backup entire desktop
-          # ----------------------------------------------
+          # --------------------------------------------
+          # BACKUP ENTIRE DESKTOP
+          # --------------------------------------------
 
           $BackupRoot = "$env:RUNNER_TEMP\MinecraftEmergencyBackup"
           $ZipPath = "$env:RUNNER_TEMP\Minecraft-EmergencyBackup.zip"
           $ShaPath = "$env:RUNNER_TEMP\Minecraft-EmergencyBackup.sha256"
 
-          Remove-Item $BackupRoot -Recurse -Force `
-            -ErrorAction SilentlyContinue
-
-          Remove-Item $ZipPath -Force `
-            -ErrorAction SilentlyContinue
-
-          Remove-Item $ShaPath -Force `
-            -ErrorAction SilentlyContinue
+          Remove-Item $BackupRoot -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $ZipPath -Force -ErrorAction SilentlyContinue
+          Remove-Item $ShaPath -Force -ErrorAction SilentlyContinue
 
           New-Item -ItemType Directory -Force -Path $BackupRoot | Out-Null
 
@@ -681,9 +629,9 @@ jobs:
             throw "Desktop backup failed. Robocopy code: $CopyCode"
           }
 
-          # ----------------------------------------------
-          # Create ZIP
-          # ----------------------------------------------
+          # --------------------------------------------
+          # CREATE ZIP
+          # --------------------------------------------
 
           Write-Host "Creating ZIP archive..."
 
@@ -695,9 +643,9 @@ jobs:
             throw "ZIP creation failed. Tar exit code: $TarCode"
           }
 
-          # ----------------------------------------------
-          # SHA256
-          # ----------------------------------------------
+          # --------------------------------------------
+          # CALCULATE SHA256
+          # --------------------------------------------
 
           Write-Host "Calculating SHA256..."
 
@@ -708,22 +656,25 @@ jobs:
 
           Write-Host "SHA256: $Hash"
 
-          # ----------------------------------------------
-          # Upload GitHub Release
-          # ----------------------------------------------
+          # --------------------------------------------
+          # UPLOAD RELEASE
+          # --------------------------------------------
 
+          $Repository = $env:GITHUB_REPOSITORY
           $Tag = "minecraft-backup-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
 
-          Write-Host "Creating GitHub Release: $Tag"
+          Write-Host "Creating Release: $Tag"
 
           gh release create $Tag `
             $ZipPath `
             $ShaPath `
-            --repo $env:GITHUB_REPOSITORY `
+            --repo $Repository `
             --title "Minecraft Emergency Backup" `
             --notes "Emergency backup of the complete NvDAdmin Desktop."
 
-          if ($LASTEXITCODE -ne 0) {
+          $ReleaseCode = $LASTEXITCODE
+
+          if ($ReleaseCode -ne 0) {
             throw "GitHub Release upload failed. Runner will not shut down."
           }
 
@@ -732,9 +683,9 @@ jobs:
           Write-Host "Release: $Tag"
           Write-Host "======================================"
 
-          # ----------------------------------------------
-          # Shutdown runner
-          # ----------------------------------------------
+          # --------------------------------------------
+          # SHUTDOWN WINDOWS RUNNER
+          # --------------------------------------------
 
           Write-Host "Windows runner will shut down in 30 seconds."
 
