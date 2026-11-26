@@ -17,41 +17,38 @@ jobs:
     timeout-minutes: 360
 
     env:
-      SERVER_DIR: 'C:\Users\NvDAdmin.runnervmbpeip\Desktop\Minecraft'
-      DESKTOP_DIR: 'C:\Users\NvDAdmin.runnervmbpeip\Desktop'
+      DESKTOP_DIR: 'C:\Users\NvDAdmin\Desktop'
+      SERVER_DIR: 'C:\Users\NvDAdmin\Desktop\Minecraft'
       BACKUP_PREFIX: minecraft-backup-
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
 
-      # 1. دریافت مخزن
+      # 1. Checkout
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. نصب Java 17
+      # 2. Java 17
       - name: Install Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # 3. آماده‌سازی مسیرها
-      - name: Prepare Windows Environment
+      # 3. تنظیم PowerShell و مسیرها
+      - name: Prepare Environment
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
 
-          Write-Host "Desktop path: $env:DESKTOP_DIR"
-          Write-Host "Server path: $env:SERVER_DIR"
-
-          New-Item -ItemType Directory -Force `
-            -Path $env:DESKTOP_DIR | Out-Null
+          Write-Host "Desktop: $env:DESKTOP_DIR"
+          Write-Host "Minecraft: $env:SERVER_DIR"
 
           java -version
 
-      # 4. ساخت حساب RDP
-      - name: Configure RDP User
+      # 4. ساخت حساب RDP و پروفایل واقعی آن
+      - name: Configure RDP User and Profile
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
@@ -62,7 +59,7 @@ jobs:
             throw "RDP_PASSWORD secret is missing."
           }
 
-          $Password = ConvertTo-SecureString `
+          $SecurePassword = ConvertTo-SecureString `
             $env:RDP_PASSWORD -AsPlainText -Force
 
           $User = Get-LocalUser -Name "NvDAdmin" `
@@ -71,14 +68,14 @@ jobs:
           if (!$User) {
             New-LocalUser `
               -Name "NvDAdmin" `
-              -Password $Password `
+              -Password $SecurePassword `
               -PasswordNeverExpires `
               -AccountNeverExpires
           }
           else {
             Set-LocalUser `
               -Name "NvDAdmin" `
-              -Password $Password
+              -Password $SecurePassword
           }
 
           Enable-LocalUser -Name "NvDAdmin"
@@ -93,6 +90,39 @@ jobs:
             -Member "NvDAdmin" `
             -ErrorAction SilentlyContinue
 
+          # ایجاد پروفایل ویندوز برای کاربر
+          $Credential = New-Object System.Management.Automation.PSCredential(
+            "NvDAdmin",
+            $SecurePassword
+          )
+
+          $ProfileProcess = Start-Process `
+            -FilePath "$env:SystemRoot\System32\cmd.exe" `
+            -ArgumentList "/c exit" `
+            -Credential $Credential `
+            -LoadUserProfile `
+            -Wait `
+            -PassThru `
+            -WindowStyle Hidden
+
+          if ($ProfileProcess.ExitCode -ne 0) {
+            throw "Could not initialize NvDAdmin profile."
+          }
+
+          $ProfilePath = "C:\Users\NvDAdmin"
+          $DesktopPath = Join-Path $ProfilePath "Desktop"
+
+          if (!(Test-Path $ProfilePath)) {
+            throw "NvDAdmin Windows profile was not created."
+          }
+
+          New-Item -ItemType Directory -Force `
+            -Path $DesktopPath | Out-Null
+
+          if ($DesktopPath -ne $env:DESKTOP_DIR) {
+            throw "Desktop path mismatch."
+          }
+
           Set-ItemProperty `
             -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
             -Name "fDenyTSConnections" `
@@ -103,7 +133,8 @@ jobs:
           Set-Service -Name TermService -StartupType Automatic
           Start-Service -Name TermService
 
-          Write-Host "RDP user configured."
+          Write-Host "RDP user and profile ready."
+          Write-Host "Desktop: $DesktopPath"
 
       # 5. نصب Tailscale
       - name: Install Tailscale
@@ -122,7 +153,7 @@ jobs:
             -Wait -PassThru
 
           if ($Install.ExitCode -ne 0) {
-            throw "Tailscale installation failed: $($Install.ExitCode)"
+            throw "Tailscale installation failed."
           }
 
           $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
@@ -161,7 +192,7 @@ jobs:
           $IP = & $Tailscale ip -4
 
           if ($LASTEXITCODE -ne 0 -or !$IP) {
-            throw "Could not obtain Tailscale IP."
+            throw "Could not get Tailscale IP."
           }
 
           "TAILSCALE_IP=$IP" | Out-File `
@@ -169,7 +200,7 @@ jobs:
 
           Write-Host "Tailscale IP: $IP"
 
-      # 7. بازیابی بکاپ
+      # 7. بازیابی آخرین بکاپ
       - name: Restore Minecraft Backup
         shell: pwsh
         run: |
@@ -213,7 +244,8 @@ jobs:
           foreach ($Release in $Releases) {
 
             $Tag = $Release.tagName
-            Write-Host "Checking release: $Tag"
+
+            Write-Host "Checking backup: $Tag"
 
             Remove-Item $TempDir -Recurse -Force `
               -ErrorAction SilentlyContinue
@@ -235,7 +267,7 @@ jobs:
             } | Select-Object -First 1
 
             if (!$ZipAsset) {
-              Write-Warning "Backup ZIP not found."
+              Write-Warning "ZIP asset missing."
               continue
             }
 
@@ -263,7 +295,7 @@ jobs:
               continue
             }
 
-            # بررسی SHA256 در صورت وجود
+            # SHA256 اختیاری
             if ($HashAsset) {
 
               gh release download $Tag `
@@ -297,10 +329,10 @@ jobs:
               Write-Host "SHA256 verified."
             }
             else {
-              Write-Warning "SHA256 asset missing. Continuing without hash verification."
+              Write-Warning "SHA256 not found. Continuing without verification."
             }
 
-            # بررسی ZIP
+            # اعتبارسنجی ZIP
             tar -tf $Zip | Out-Null
 
             if ($LASTEXITCODE -ne 0) {
@@ -308,7 +340,7 @@ jobs:
               continue
             }
 
-            # استخراج
+            # استخراج ZIP
             tar -xf $Zip -C $ExtractDir
 
             if ($LASTEXITCODE -ne 0) {
@@ -328,14 +360,16 @@ jobs:
             if (Test-Path $MinecraftFolder -PathType Container) {
 
               Write-Host "Full desktop backup detected."
-              Write-Host "Restoring to: $env:DESKTOP_DIR"
+              Write-Host "Restoring to $env:DESKTOP_DIR"
 
+              # فقط فایل‌های بکاپ را برگردان.
+              # فایل‌های اضافی دسکتاپ حذف نمی‌شوند.
               robocopy $ExtractDir $env:DESKTOP_DIR `
-                /MIR /COPY:DAT /DCOPY:DAT /R:2 /W:2 /XJ /SL
+                /E /COPY:DAT /DCOPY:DAT /R:2 /W:2 /XJ /SL
 
               $CopyCode = $LASTEXITCODE
 
-              Write-Host "Robocopy exit code: $CopyCode"
+              Write-Host "Restore Robocopy code: $CopyCode"
 
               if ($CopyCode -ge 8) {
                 Write-Warning "Desktop restore failed."
@@ -343,6 +377,7 @@ jobs:
               }
 
               $global:LASTEXITCODE = 0
+
             }
             else {
 
@@ -360,6 +395,7 @@ jobs:
             }
 
             Write-Host "Restore successful: $Tag"
+
             $Restored = $true
             break
           }
@@ -368,23 +404,23 @@ jobs:
             throw "No valid backup could be restored."
           }
 
-          Remove-Item "$env:DESKTOP_DIR\STOP_SERVER.txt" `
-            -Force -ErrorAction SilentlyContinue
-
           Write-Host "RESTORE COMPLETED SUCCESSFULLY"
+          Write-Host "Restored desktop: $env:DESKTOP_DIR"
 
           $global:LASTEXITCODE = 0
           exit 0
 
-      # 8. بررسی فایل‌های Minecraft
+      # 8. بررسی سرور
       - name: Prepare Minecraft
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Checking server directory: $env:SERVER_DIR"
+          if (!(Test-Path $env:DESKTOP_DIR)) {
+            throw "Desktop directory not found."
+          }
 
-          if (!(Test-Path $env:SERVER_DIR -PathType Container)) {
+          if (!(Test-Path $env:SERVER_DIR)) {
             throw "Minecraft directory not found."
           }
 
@@ -401,8 +437,9 @@ jobs:
             -Force -ErrorAction SilentlyContinue
 
           Write-Host "Minecraft is ready."
+          Write-Host "Server directory: $env:SERVER_DIR"
 
-      # 9. اطلاعات اتصال RDP
+      # 9. اطلاعات RDP
       - name: Show RDP Information
         shell: pwsh
         run: |
@@ -413,9 +450,10 @@ jobs:
           Write-Host "Port: 3389"
           Write-Host "Username: NvDAdmin"
           Write-Host "Password: GitHub Secret RDP_PASSWORD"
+          Write-Host "Desktop: $env:DESKTOP_DIR"
           Write-Host "=================================="
 
-      # 10. اجرای سرور و انتظار برای فرمان توقف
+      # 10. اجرای Minecraft و انتظار برای توقف
       - name: Start Minecraft and Keep Runner Alive
         shell: pwsh
         run: |
@@ -441,27 +479,23 @@ jobs:
           $Server = New-Object System.Diagnostics.Process
           $Server.StartInfo = $StartInfo
 
-          $OutputHandler = {
-            if ($null -ne $EventArgs.Data) {
-              Write-Host $EventArgs.Data
-            }
-          }
-
-          $ErrorHandler = {
-            if ($null -ne $EventArgs.Data) {
-              Write-Host $EventArgs.Data
-            }
-          }
-
           Register-ObjectEvent `
             -InputObject $Server `
             -EventName OutputDataReceived `
-            -Action $OutputHandler | Out-Null
+            -Action {
+              if ($null -ne $EventArgs.Data) {
+                Write-Host $EventArgs.Data
+              }
+            } | Out-Null
 
           Register-ObjectEvent `
             -InputObject $Server `
             -EventName ErrorDataReceived `
-            -Action $ErrorHandler | Out-Null
+            -Action {
+              if ($null -ne $EventArgs.Data) {
+                Write-Host $EventArgs.Data
+              }
+            } | Out-Null
 
           if (!$Server.Start()) {
             throw "Minecraft failed to start."
@@ -479,8 +513,7 @@ jobs:
           while ((Get-Date) -lt $Deadline) {
 
             if ($Server.HasExited) {
-              Write-Warning "Minecraft process exited unexpectedly."
-              break
+              throw "Minecraft exited unexpectedly. Backup refused."
             }
 
             if (Test-Path $StopFile) {
@@ -492,37 +525,34 @@ jobs:
             Start-Sleep -Seconds 3
           }
 
-          if (!$Server.HasExited) {
+          if (!$StopRequested) {
+            Write-Host "Time limit reached. Requesting shutdown."
+          }
 
-            if (!$StopRequested) {
-              Write-Warning "Workflow time limit reached."
-            }
+          Write-Host "Sending stop command."
 
-            Write-Host "Sending stop command."
+          try {
+            $Server.StandardInput.WriteLine("stop")
+            $Server.StandardInput.Flush()
+          }
+          catch {
+            throw "Could not send stop command: $_"
+          }
 
-            try {
-              $Server.StandardInput.WriteLine("stop")
-              $Server.StandardInput.Flush()
-            }
-            catch {
-              Write-Warning "Could not send stop command: $_"
-            }
-
-            if (!$Server.WaitForExit(120000)) {
-              throw "Minecraft did not stop safely. Backup refused."
-            }
+          if (!$Server.WaitForExit(120000)) {
+            throw "Minecraft did not stop safely. Backup refused."
           }
 
           $Server.WaitForExit()
 
-          Write-Host "Minecraft process stopped."
+          Write-Host "Minecraft stopped."
 
           New-Item -ItemType File -Force `
             -Path "$env:RUNNER_TEMP\minecraft-safe-stop.txt" | Out-Null
 
           Write-Host "Safe shutdown confirmed."
 
-      # 11. بکاپ کامل دسکتاپ
+      # 11. بکاپ کل دسکتاپ
       - name: Create Full Desktop Backup
         if: always()
         shell: pwsh
@@ -557,13 +587,13 @@ jobs:
 
           $CopyCode = $LASTEXITCODE
 
-          Write-Host "Robocopy exit code: $CopyCode"
+          Write-Host "Backup Robocopy code: $CopyCode"
 
           if ($CopyCode -ge 8) {
             throw "Desktop backup failed. Robocopy code: $CopyCode"
           }
 
-          Write-Host "Creating ZIP."
+          Write-Host "Creating ZIP archive."
 
           tar -a -c -f $Zip -C $BackupDir .
 
@@ -572,13 +602,13 @@ jobs:
           }
 
           if (!(Test-Path $Zip)) {
-            throw "ZIP file was not created."
+            throw "Backup ZIP was not created."
           }
 
           $ZipSize = (Get-Item $Zip).Length
 
           if ($ZipSize -lt 1MB) {
-            throw "ZIP file is too small."
+            throw "Backup ZIP is too small."
           }
 
           $Hash = (
@@ -597,7 +627,7 @@ jobs:
           Write-Host "Backup size: $([math]::Round($ZipSize / 1GB, 2)) GB"
           Write-Host "SHA256: $Hash"
 
-      # 12. انتشار بکاپ در Release
+      # 12. انتشار بکاپ در GitHub Releases
       - name: Upload Backup to GitHub Release
         if: always()
         shell: pwsh
