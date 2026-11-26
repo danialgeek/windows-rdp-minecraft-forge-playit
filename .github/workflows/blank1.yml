@@ -135,12 +135,27 @@ jobs:
           Add-Content $env:GITHUB_ENV "BORE_EXE=$BoreExe"
           Write-Host "Bore installed: $BoreExe"
 
+      - name: Ensure 7-Zip is installed for encrypted browser backups
+        shell: pwsh
+        run: |
+          $SevenZip = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
+          if (!(Test-Path $SevenZip)) {
+            $Choco = Get-Command choco.exe -ErrorAction SilentlyContinue
+            if (!$Choco) { throw "7-Zip is missing and Chocolatey is unavailable." }
+            & $Choco.Source install 7zip --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "Could not install 7-Zip." }
+          }
+          if (!(Test-Path $SevenZip)) { throw "7-Zip installation completed but 7z.exe was not found." }
+          Write-Host "7-Zip ready: $SevenZip"
+
       # ================================================
       # 4. RESTORE LATEST BACKUP
       # ================================================
 
       - name: Restore latest Desktop and browser backup
         shell: pwsh
+        env:
+          BROWSER_BACKUP_PASSWORD: ${{ secrets.BROWSER_BACKUP_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
@@ -198,6 +213,10 @@ jobs:
                 --pattern "Browsers-Chrome.zip.part*" `
                 --pattern "Browsers-Edge.zip" `
                 --pattern "Browsers-Edge.zip.part*" `
+                --pattern "Browsers-Chrome.7z" `
+                --pattern "Browsers-Chrome.7z.part*" `
+                --pattern "Browsers-Edge.7z" `
+                --pattern "Browsers-Edge.7z.part*" `
                 --pattern "AppData-Local.zip" `
                 --pattern "Minecraft-EmergencyBackup.sha256"
 
@@ -212,12 +231,12 @@ jobs:
               # Desktop/Chrome/Edge backup and older ProgramData split backups.
               $SplitFiles = @(
                 Get-ChildItem $DownloadDir -File | Where-Object {
-                  $_.Name -match '^(.+\.zip)\.part[0-9]+$'
+                  $_.Name -match '^(.+\.(?:zip|7z))\.part[0-9]+$'
                 }
               )
 
               $SplitGroups = @($SplitFiles | Group-Object {
-                [regex]::Match($_.Name, '^(.+\.zip)\.part[0-9]+$').Groups[1].Value
+                [regex]::Match($_.Name, '^(.+\.(?:zip|7z))\.part[0-9]+$').Groups[1].Value
               })
 
               foreach ($Group in $SplitGroups) {
@@ -239,13 +258,13 @@ jobs:
                 Write-Host "Reassembled $($Group.Name) from $($Group.Count) parts."
               }
 
-              $ZipFiles = @(
-                Get-ChildItem $DownloadDir -Filter "*.zip" -File | Where-Object {
-                  $_.Name -in @("Desktop.zip", "Browsers-Chrome.zip", "Browsers-Edge.zip", "AppData-Local.zip")
+              $ArchiveFiles = @(
+                Get-ChildItem $DownloadDir -File | Where-Object {
+                  $_.Name -in @("Desktop.zip", "Browsers-Chrome.zip", "Browsers-Edge.zip", "Browsers-Chrome.7z", "Browsers-Edge.7z", "AppData-Local.zip")
                 }
               )
 
-              if ($ZipFiles.Count -eq 0) {
+              if ($ArchiveFiles.Count -eq 0) {
                 continue
               }
 
@@ -271,8 +290,8 @@ jobs:
               # verified parts, because the combined file has no manifest entry.
               $AssetsToVerify = @(
                 Get-ChildItem $DownloadDir -File | Where-Object {
-                  $_.Name -match '^.+\.zip\.part[0-9]+$' -or
-                  ($_.Extension -eq ".zip" -and !(Test-Path (Join-Path $DownloadDir ($_.Name + ".part001"))))
+                  $_.Name -match '^.+\.(?:zip|7z)\.part[0-9]+$' -or
+                  ($_.Extension -in @(".zip", ".7z") -and !(Test-Path (Join-Path $DownloadDir ($_.Name + ".part001"))))
                 }
               )
 
@@ -295,11 +314,28 @@ jobs:
                 continue
               }
 
-              foreach ($Zip in $ZipFiles) {
-                tar.exe -xf $Zip.FullName -C $ExtractDir
+              foreach ($Archive in $ArchiveFiles) {
+                if ($Archive.Extension -eq ".7z") {
+                  if ([string]::IsNullOrWhiteSpace($env:BROWSER_BACKUP_PASSWORD)) {
+                    throw "BROWSER_BACKUP_PASSWORD repository secret is required to decrypt Chrome/Edge backups."
+                  }
 
-                $Code = $LASTEXITCODE
-                $global:LASTEXITCODE = 0
+                  $SevenZip = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
+                  if (!(Test-Path $SevenZip)) {
+                    $SevenZipCommand = Get-Command 7z.exe -ErrorAction SilentlyContinue
+                    if ($SevenZipCommand) { $SevenZip = $SevenZipCommand.Source }
+                  }
+                  if (!(Test-Path $SevenZip)) { throw "7-Zip executable was not found on this runner." }
+
+                  & $SevenZip x $Archive.FullName "-p$env:BROWSER_BACKUP_PASSWORD" "-o$ExtractDir" -y
+                  $Code = $LASTEXITCODE
+                  $global:LASTEXITCODE = 0
+                }
+                else {
+                  tar.exe -xf $Archive.FullName -C $ExtractDir
+                  $Code = $LASTEXITCODE
+                  $global:LASTEXITCODE = 0
+                }
 
                 if ($Code -ne 0) {
                   $Valid = $false
@@ -933,6 +969,8 @@ jobs:
       - name: Stop Minecraft and back up Desktop, Chrome and Edge
         if: always()
         shell: pwsh
+        env:
+          BROWSER_BACKUP_PASSWORD: ${{ secrets.BROWSER_BACKUP_PASSWORD }}
         run: |
           $ErrorActionPreference = "Continue"
           $PSNativeCommandUseErrorActionPreference = $false
@@ -942,6 +980,11 @@ jobs:
           $LogDir = "$env:RUNNER_TEMP\BackupLogs"
           $ShaPath = "$env:RUNNER_TEMP\Minecraft-EmergencyBackup.sha256"
           $ReportPath = "$env:RUNNER_TEMP\BackupReport.txt"
+
+          if ([string]::IsNullOrWhiteSpace($env:BROWSER_BACKUP_PASSWORD)) {
+            throw "BROWSER_BACKUP_PASSWORD repository secret is missing. Add it before backing up browser profiles to a public Release."
+          }
+          Write-Host "::add-mask::$env:BROWSER_BACKUP_PASSWORD"
 
           Remove-Item $BackupRoot,$ZipDir,$LogDir,$ShaPath,$ReportPath -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -1250,7 +1293,9 @@ jobs:
             "Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
             "Repository: $env:GITHUB_REPOSITORY"
             "Included: Desktop (including Minecraft), Chrome User Data, Edge User Data"
+            "Security: Chrome/Edge archives are AES-256 encrypted before public upload."
             "Excluded: full AppData, ProgramData, Documents, Saved Games, Registry and browser cache folders"
+            "Restore requirement: BROWSER_BACKUP_PASSWORD GitHub Actions secret must match the password used for encryption."
             ""
             "Errors: $($script:BackupErrors.Count)"
             ""
@@ -1293,8 +1338,6 @@ jobs:
 
           $Folders = @(
             "Desktop",
-            "Browsers\Chrome",
-            "Browsers\Edge",
             "Logs",
             "BackupReport.txt"
           )
@@ -1365,6 +1408,79 @@ jobs:
           }
 
           # ============================================
+          # ENCRYPT CHROME + EDGE PROFILES FOR PUBLIC RELEASE
+          # ============================================
+
+          $SevenZip = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
+          if (!(Test-Path $SevenZip)) {
+            $SevenZipCommand = Get-Command 7z.exe -ErrorAction SilentlyContinue
+            if ($SevenZipCommand) { $SevenZip = $SevenZipCommand.Source }
+          }
+          if (!(Test-Path $SevenZip)) {
+            throw "7-Zip executable was not found. Cannot safely encrypt browser profiles."
+          }
+
+          foreach ($Browser in @("Chrome", "Edge")) {
+            $RelativeFolder = "Browsers\$Browser"
+            $SourceFolder = Join-Path $BackupRoot $RelativeFolder
+            if (!(Test-Path $SourceFolder)) {
+              Write-Warning "$Browser profile folder was not present. Skipping encrypted archive."
+              continue
+            }
+
+            $ArchivePath = Join-Path $ZipDir "Browsers-$Browser.7z"
+            Write-Host "Creating AES-256 encrypted archive: Browsers-$Browser.7z"
+            Push-Location $BackupRoot
+            try {
+              & $SevenZip a -t7z -mx=5 -mhe=on "-p$env:BROWSER_BACKUP_PASSWORD" $ArchivePath $RelativeFolder
+              $SevenZipCode = $LASTEXITCODE
+              $global:LASTEXITCODE = 0
+            }
+            finally { Pop-Location }
+
+            if ($SevenZipCode -ne 0 -or !(Test-Path $ArchivePath)) {
+              throw "Could not create encrypted $Browser browser archive."
+            }
+
+            # Split encrypted archives too, so no GitHub Release asset reaches 2 GiB.
+            $ChunkSize = [int64](1536 * 1024 * 1024)
+            if ((Get-Item $ArchivePath).Length -gt $ChunkSize) {
+              $TemporaryArchive = Join-Path $ZipDir ("Browsers-$Browser.7z.source.tmp")
+              Move-Item $ArchivePath $TemporaryArchive -Force
+              $InputStream = [System.IO.File]::OpenRead($TemporaryArchive)
+              try {
+                $PartNumber = 0
+                $Buffer = New-Object byte[] (8MB)
+                while ($true) {
+                  $PartNumber++
+                  $PartName = "Browsers-$Browser.7z.part{0:D3}" -f $PartNumber
+                  $PartPath = Join-Path $ZipDir $PartName
+                  $PartStream = [System.IO.File]::Open($PartPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                  $Remaining = $ChunkSize
+                  try {
+                    while ($Remaining -gt 0) {
+                      $Wanted = [int][Math]::Min($Buffer.Length, $Remaining)
+                      $Read = $InputStream.Read($Buffer, 0, $Wanted)
+                      if ($Read -le 0) { break }
+                      $PartStream.Write($Buffer, 0, $Read)
+                      $Remaining -= $Read
+                    }
+                  }
+                  finally { $PartStream.Dispose() }
+                  if ((Get-Item $PartPath).Length -eq 0) { Remove-Item $PartPath -Force; break }
+                  $ArchiveNames += $PartName
+                  if ($InputStream.Position -ge $InputStream.Length) { break }
+                }
+              }
+              finally { $InputStream.Dispose() }
+              Remove-Item $TemporaryArchive -Force
+            }
+            else {
+              $ArchiveNames += "Browsers-$Browser.7z"
+            }
+          }
+
+          # ============================================
           # SHA256
           # ============================================
 
@@ -1397,22 +1513,14 @@ jobs:
             $ReleaseTitle = "Minecraft Emergency Backup (Partial)"
             $ReleaseNotes = @(
               "Emergency backup uploaded with partial copy errors."
-              "Successfully copied Desktop, Chrome and Edge data are included in the ZIP assets."
+              "Successfully copied Desktop data is included in ZIP assets; Chrome/Edge profiles are included in AES-256 encrypted 7z assets."
               "Some source files could not be copied. See BackupReport.txt.zip and Logs.zip for details."
               "Backup error entries: $($script:BackupErrors.Count)"
             ) -join "`n"
           }
           else {
             $ReleaseTitle = "Minecraft Desktop + Chrome + Edge Backup"
-            $ReleaseNotes = "Desktop (including Minecraft) and Chrome/Edge browser profiles backed up. Cache folders are excluded. See BackupReport.txt.zip for the report."
-          }
-
-          $RepositoryIsPrivate = gh api "repos/$env:GITHUB_REPOSITORY" --jq .private
-          $PrivateCheckCode = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
-
-          if ($PrivateCheckCode -ne 0 -or "$RepositoryIsPrivate".Trim() -ne "true") {
-            throw "Refusing to upload Chrome/Edge browser profile data to a public or unverifiable repository. Make the repository private, then run the backup again."
+            $ReleaseNotes = "Desktop (including Minecraft) and Chrome/Edge browser profiles backed up. Browser profiles are AES-256 encrypted 7z assets. Cache folders are excluded. See BackupReport.txt.zip for the report."
           }
 
           gh release create $Tag `
