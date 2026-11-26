@@ -105,11 +105,70 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path $env:DESKTOP_DIR | Out-Null
 
+          # Permit RDP only from Tailscale's CGNAT and IPv6 address ranges.
+          # Bore remains available as a separate public relay connection.
+          New-NetFirewallRule -Name "Tailscale-RDP-IPv4" `
+            -DisplayName "RDP from Tailscale IPv4" `
+            -Direction Inbound -Action Allow -Protocol TCP `
+            -LocalPort 3389 -RemoteAddress "100.64.0.0/10" `
+            -Profile Any -ErrorAction SilentlyContinue | Out-Null
+          New-NetFirewallRule -Name "Tailscale-RDP-IPv6" `
+            -DisplayName "RDP from Tailscale IPv6" `
+            -Direction Inbound -Action Allow -Protocol TCP `
+            -LocalPort 3389 -RemoteAddress "fd7a:115c:a1e0::/48" `
+            -Profile Any -ErrorAction SilentlyContinue | Out-Null
+
           Write-Host "RDP user configured."
-          Write-Host "RDP listener enabled. Public RDP access will use the outbound Bore tunnel."
+          Write-Host "RDP listener enabled for Tailscale and the separate Bore relay."
 
       # ================================================
-      # 3. INSTALL BORE TUNNEL CLIENT
+      # 3. CONNECT THIS WINDOWS RUNNER TO TAILSCALE
+      # ================================================
+
+      - name: Connect Windows runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: danial-minecraft-rdp
+          version: latest
+          log-mode: normal
+
+      - name: Publish Tailscale RDP address
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Tailscale = Get-Command tailscale.exe -ErrorAction SilentlyContinue
+          if ($Tailscale) {
+            $TailscaleExe = $Tailscale.Source
+          }
+          else {
+            $Candidates = @(
+              "$env:ProgramFiles\Tailscale\tailscale.exe",
+              "$env:ProgramFiles\Tailscale IPN\tailscale.exe"
+            )
+            $TailscaleExe = $Candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (!$TailscaleExe) {
+            throw "Tailscale CLI was not found after the GitHub Action connected the runner."
+          }
+
+          $TailscaleIP = (& $TailscaleExe ip --4 | Select-Object -First 1).Trim()
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($TailscaleIP)) {
+            throw "Could not obtain the runner's Tailscale IPv4 address."
+          }
+
+          Add-Content $env:GITHUB_ENV "TAILSCALE_RDP_IP=$TailscaleIP"
+          "## Tailscale RDP" | Add-Content $env:GITHUB_STEP_SUMMARY
+          ("- Address: {0}:3389" -f $TailscaleIP) | Add-Content $env:GITHUB_STEP_SUMMARY
+          "- Username: ``NvDAdmin``" | Add-Content $env:GITHUB_STEP_SUMMARY
+          Write-Host "=========================================="
+          Write-Host ("TAILSCALE RDP ADDRESS: {0}:3389" -f $TailscaleIP)
+          Write-Host "RDP USERNAME: NvDAdmin"
+          Write-Host ("Connect with Windows mstsc using {0}:3389" -f $TailscaleIP)
+          Write-Host "=========================================="
+
+      # ================================================
+      # 4. INSTALL BORE TUNNEL CLIENT
       # ================================================
 
       - name: Install Bore tunnel client
@@ -658,20 +717,58 @@ jobs:
           }
 
           Remove-Item $PanelLog,$PanelErr -Force -ErrorAction SilentlyContinue
-          $PanelProcess = Start-Process -FilePath $PanelExe `
-            -WorkingDirectory $PanelDir `
-            -PassThru `
-            -RedirectStandardOutput $PanelLog `
-            -RedirectStandardError $PanelErr
-          Add-Content $env:GITHUB_ENV "PANEL_PID=$($PanelProcess.Id)"
+
+          # Start 3X-UI through Task Scheduler under SYSTEM. A process launched
+          # directly by a GitHub Actions step can be terminated by the runner's
+          # per-step process cleanup when that step ends. A scheduled task gives
+          # the panel an independent lifetime across workflow steps.
+          $TaskName = "GitHubActions-3XUI-Panel"
+          Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+          function ConvertTo-PowerShellLiteral {
+            param([string]$Value)
+            return "'" + $Value.Replace("'", "''") + "'"
+          }
+
+          # Task Scheduler starts with a clean SYSTEM environment, so explicitly
+          # recreate the X-UI paths and base-path variables in a small launcher.
+          $LauncherScript = Join-Path $env:RUNNER_TEMP "start-3xui-panel.ps1"
+          $LauncherContent = @"
+          `$ErrorActionPreference = 'Stop'
+          `$env:XUI_DB_FOLDER = $(ConvertTo-PowerShellLiteral $DbDir)
+          `$env:XUI_LOG_FOLDER = $(ConvertTo-PowerShellLiteral $LogDir)
+          `$env:XUI_BIN_FOLDER = $(ConvertTo-PowerShellLiteral $BinDir)
+          `$env:XUI_INIT_WEB_BASE_PATH = $(ConvertTo-PowerShellLiteral $PanelBasePath)
+          Set-Location -LiteralPath $(ConvertTo-PowerShellLiteral $PanelDir)
+          & $(ConvertTo-PowerShellLiteral $PanelExe) *> $(ConvertTo-PowerShellLiteral $PanelLog)
+          "@
+          Set-Content -Path $LauncherScript -Value $LauncherContent -Encoding UTF8
+
+          $TaskAction = New-ScheduledTaskAction `
+            -Execute (Join-Path $PSHOME "pwsh.exe") `
+            -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$LauncherScript`"" `
+            -WorkingDirectory $PanelDir
+          $TaskPrincipal = New-ScheduledTaskPrincipal `
+            -UserId "SYSTEM" `
+            -LogonType ServiceAccount `
+            -RunLevel Highest
+          $TaskSettings = New-ScheduledTaskSettingsSet `
+            -ExecutionTimeLimit ([TimeSpan]::Zero) `
+            -StartWhenAvailable `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries
+
+          Register-ScheduledTask `
+            -TaskName $TaskName `
+            -Action $TaskAction `
+            -Principal $TaskPrincipal `
+            -Settings $TaskSettings `
+            -Force | Out-Null
+          Start-ScheduledTask -TaskName $TaskName
 
           $Deadline = (Get-Date).AddMinutes(2)
           $PanelReady = $false
           while ((Get-Date) -lt $Deadline) {
-            if ($PanelProcess.HasExited) {
-              Get-Content $PanelLog,$PanelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-              throw "3X-UI exited before opening its HTTPS panel."
-            }
             try {
               $Response = Invoke-WebRequest `
                 -Uri "https://127.0.0.1:2053$PanelBasePath" `
@@ -688,8 +785,15 @@ jobs:
           }
 
           if (!$PanelReady) {
+            Write-Host "--- Scheduled task state ---"
+            Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue |
+              Get-ScheduledTaskInfo | Format-List * | Out-String | Write-Host
+            Write-Host "--- 3X-UI process snapshot ---"
+            Get-Process -Name "3x-ui","x-ui" -ErrorAction SilentlyContinue |
+              Select-Object Id,ProcessName,StartTime,CPU,Responding |
+              Format-Table -AutoSize | Out-String | Write-Host
             Get-Content $PanelLog,$PanelErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-            throw "3X-UI did not serve HTTPS on 127.0.0.1:2053 within two minutes."
+            throw "3X-UI did not serve HTTPS on 127.0.0.1:2053 within two minutes after scheduled-task launch."
           }
 
           $LocalPanelUrl = "https://127.0.0.1:2053$PanelBasePath"
@@ -881,16 +985,19 @@ jobs:
             }
           }
 
-          # Do not trust PANEL_PID here. The Windows 3X-UI launcher may exit
-          # after spawning its actual service process. The listening socket is
-          # the authoritative health check for the panel.
+          # The panel is launched by Task Scheduler, independently of the
+          # GitHub Actions step process tree. The listening socket is the
+          # authoritative health check for the panel.
           Assert-Service -Name "3X-UI" -Port 2053
           Assert-Service -Name "RDP" -Port 3389
           Assert-BoreProcess -Name "RDP" -ProcessId $env:BORE_RDP_PID
           Assert-BoreProcess -Name "VLESS" -ProcessId $env:BORE_VLESS_PID
 
           Write-Host "=============================================="
-          Write-Host "RDP: bore.pub:$env:BORE_RDP_PORT"
+          Write-Host "RDP via Bore: bore.pub:$env:BORE_RDP_PORT"
+          if (![string]::IsNullOrWhiteSpace($env:TAILSCALE_RDP_IP)) {
+            Write-Host ("RDP via Tailscale: {0}:3389" -f $env:TAILSCALE_RDP_IP)
+          }
           Write-Host "3X-UI local URL: https://127.0.0.1:2053$env:PANEL_BASE_PATH"
           Write-Host "3X-UI first login: admin / admin"
           Write-Host "VLESS REALITY endpoint: bore.pub:$env:VLESS_LOCAL_PORT"
@@ -898,12 +1005,13 @@ jobs:
           Write-Host "=============================================="
           Write-Host ""
           Write-Host "SECURITY SETUP REQUIRED BEFORE PUBLIC PANEL ACCESS:"
-          Write-Host "1. Connect to RDP using the public address above."
-          Write-Host "2. Open https://127.0.0.1:2053$env:PANEL_BASE_PATH inside the RDP desktop."
-          Write-Host "3. Log in with admin / admin and immediately change the panel username and password."
-          Write-Host "4. After changing credentials, run this in RDP PowerShell:"
+          Write-Host ("1. For Tailscale RDP, use {0}:3389 with mstsc." -f $env:TAILSCALE_RDP_IP)
+          Write-Host "2. Alternative Bore RDP address: bore.pub:$env:BORE_RDP_PORT"
+          Write-Host "3. Open https://127.0.0.1:2053$env:PANEL_BASE_PATH inside the RDP desktop."
+          Write-Host "4. Log in with admin / admin and immediately change the panel username and password."
+          Write-Host "5. After changing credentials, run this in RDP PowerShell:"
           Write-Host "   New-Item -ItemType File -Path '$env:DESKTOP_DIR\ENABLE_3XUI_PUBLIC.txt' -Force"
-          Write-Host "5. The workflow will publish the panel through HTTPS on a separate Bore port."
+          Write-Host "6. The workflow will publish the panel through HTTPS on a separate Bore port."
           Write-Host "Start Minecraft manually from the desktop. Cancel workflow to request emergency backup (best effort)."
 
           while (!(Test-Path $Marker)) {
