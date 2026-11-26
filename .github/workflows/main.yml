@@ -44,6 +44,7 @@ jobs:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
 
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
             throw "RDP_PASSWORD secret is missing."
@@ -103,6 +104,7 @@ jobs:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
 
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
             throw "TAILSCALE_AUTHKEY secret is missing."
@@ -133,11 +135,20 @@ jobs:
             "--hostname=minecraft-$env:GITHUB_RUN_ID" `
             "--accept-routes"
 
-          if ($LASTEXITCODE -ne 0) {
+          $TailscaleCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+
+          if ($TailscaleCode -ne 0) {
             throw "Tailscale connection failed."
           }
 
           $IP = & $Tailscale ip -4
+          $IPCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+
+          if ($IPCode -ne 0) {
+            throw "Could not retrieve Tailscale IP."
+          }
 
           Write-Host ""
           Write-Host "===================================="
@@ -176,7 +187,10 @@ jobs:
             --limit 100 `
             --json tagName,isDraft,isPrerelease,createdAt
 
-          if ($LASTEXITCODE -ne 0) {
+          $ReleaseCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+
+          if ($ReleaseCode -ne 0) {
             throw "Could not retrieve GitHub Releases."
           }
 
@@ -211,7 +225,10 @@ jobs:
                 --pattern "Minecraft-EmergencyBackup.zip" `
                 --dir $DownloadDir
 
-              if ($LASTEXITCODE -ne 0) {
+              $DownloadCode = $LASTEXITCODE
+              $global:LASTEXITCODE = 0
+
+              if ($DownloadCode -ne 0) {
                 Write-Warning "ZIP download failed. Trying another release."
                 continue
               }
@@ -229,6 +246,7 @@ jobs:
                 --dir $DownloadDir
 
               $ShaCode = $LASTEXITCODE
+              $global:LASTEXITCODE = 0
 
               if ($ShaCode -eq 0) {
                 $ShaFile = Join-Path $DownloadDir "Minecraft-EmergencyBackup.sha256"
@@ -255,15 +273,30 @@ jobs:
 
               tar.exe -xf $Zip -C $ExtractDir
 
-              if ($LASTEXITCODE -ne 0) {
+              $TarCode = $LASTEXITCODE
+              $global:LASTEXITCODE = 0
+
+              if ($TarCode -ne 0) {
                 Write-Warning "Extraction failed. Trying another release."
                 continue
               }
+
+              $ExtractedFiles = @(
+                Get-ChildItem $ExtractDir -Recurse -File
+              )
+
+              if ($ExtractedFiles.Count -eq 0) {
+                Write-Warning "Extracted backup is empty. Trying another release."
+                continue
+              }
+
+              Write-Host "Extracted files: $($ExtractedFiles.Count)"
 
               robocopy $ExtractDir $env:DESKTOP_DIR `
                 /E /COPY:DAT /DCOPY:DAT /R:2 /W:2 /XJ /SL
 
               $CopyCode = $LASTEXITCODE
+              $global:LASTEXITCODE = 0
 
               Write-Host "Robocopy exit code: $CopyCode"
 
@@ -282,6 +315,8 @@ jobs:
             }
           }
 
+          $global:LASTEXITCODE = 0
+
       # ================================================
       # 5. GENERATE RCON PASSWORD AND CONFIGURE SERVER
       # ================================================
@@ -290,8 +325,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
 
-          # Generate a new random 32-byte password.
           $RandomBytes = New-Object byte[] 32
           $Rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
 
@@ -304,7 +339,6 @@ jobs:
 
           $RconPassword = [Convert]::ToHexString($RandomBytes)
 
-          # Make the password available to later steps.
           Add-Content -Path $env:GITHUB_ENV -Value "RCON_PASSWORD=$RconPassword"
 
           New-Item -ItemType Directory -Force -Path $env:SERVER_DIR | Out-Null
@@ -613,6 +647,7 @@ jobs:
             /E /COPY:DAT /DCOPY:DAT /R:2 /W:2 /XJ /SL
 
           $CopyCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
 
           Write-Host "Backup Robocopy exit code: $CopyCode"
 
@@ -629,6 +664,7 @@ jobs:
           tar.exe -a -c -f $ZipPath -C $BackupRoot .
 
           $TarCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
 
           if ($TarCode -ne 0 -or !(Test-Path $ZipPath)) {
             throw "ZIP creation failed. Tar exit code: $TarCode"
@@ -663,7 +699,10 @@ jobs:
             --title "Minecraft Emergency Backup" `
             --notes "Emergency backup of the complete NvDAdmin Desktop."
 
-          if ($LASTEXITCODE -ne 0) {
+          $ReleaseCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+
+          if ($ReleaseCode -ne 0) {
             throw "GitHub Release upload failed. Runner will not shut down."
           }
 
@@ -680,6 +719,9 @@ jobs:
 
           shutdown.exe /s /t 30 /f
 
-          if ($LASTEXITCODE -ne 0) {
+          $ShutdownCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+
+          if ($ShutdownCode -ne 0) {
             throw "Windows shutdown command failed."
           }
